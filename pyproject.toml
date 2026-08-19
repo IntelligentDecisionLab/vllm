@@ -1,0 +1,34 @@
+[project]
+name = "sglang-inference-service"
+version = "0.1.0"
+description = "Multi-model OpenAI-compatible SGLang service for llama.cpp presets"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "fastapi>=0.115",
+    "httpx>=0.28",
+    "huggingface-hub>=0.30",
+    "uvicorn[standard]>=0.34",
+]
+
+[project.optional-dependencies]
+# SGLang has hardware/CUDA-specific installation choices.  Keep it optional so
+# the gateway can be inspected and tested on a CPU-only machine, while the
+# normal GPU install remains: `uv sync --extra runtime`.
+runtime = [
+    "sglang>=0.5.0",
+]
+test = ["pytest>=8.0"]
+
+[project.scripts]
+sglang-service = "sglang_service.cli:main"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["sglang_service"]
+
+[tool.uv.sources]
+sglang = { git = "https://github.com/sgl-project/sglang.git", subdirectory = "python" }
