@@ -1,0 +1,90 @@
+# vLLM Model Catalog Configuration
+# Native Transformers / Safetensors FP8 models
+
+[default]
+context_length = 262144
+kv_cache_dtype = "fp8_e4m3"
+tensor_parallel_size = 1
+data_parallel_size = 1
+mem_fraction_static = 0.45
+max_num_seqs = 16
+max_num_batched_tokens = 2048
+idle_seconds = 1800
+reasoning_parser = "qwen3"
+tool_call_parser = "qwen3_coder"
+vllm_args = [
+    "--enable-chunked-prefill",
+    "--enable-prefix-caching",
+    "--attention-backend", "flashinfer",
+    "--enable-flashinfer-autotune",
+    "--async-scheduling",
+    "--speculative-config", '{"method": "mtp", "num_speculative_tokens": 2}',
+]
+
+# --- 1. Local Coding Agent 專用 (27B 獨佔 GPU 0) ---
+["qwen3.8-27b"]
+model_path = "Qwen/Qwen3.8-27B-FP8"
+context_length = 262144
+kv_cache_dtype = "fp8_e4m3"
+tensor_parallel_size = 1
+data_parallel_size = 1
+mem_fraction_static = 0.45          # GPU 0 佔 43GB (28GB 權重 + 15GB KV Cache)，仍留 53GB
+max_num_seqs = 16
+idle_seconds = 0.0
+reasoning_parser = "qwen3"
+tool_call_parser = "qwen3_coder"
+default = true
+aliases = ["qwen3.8-27b-fp8"]
+vllm_args = [
+    "--device-ids", "0",            # 鎖定 GPU 0，完全零跨卡通訊
+    "--enable-chunked-prefill",
+    "--enable-prefix-caching",
+    "--attention-backend", "flashinfer",
+    "--enable-flashinfer-autotune",
+    "--async-scheduling",
+    "--speculative-config", '{"method": "mtp", "num_speculative_tokens": 2}',
+]
+
+# --- 2. 批次實驗專用 (9B 獨佔 GPU 1，高並發/高吞吐) ---
+["qwen3.5-9b"]
+model_path = "Qwen/Qwen3.5-9B"
+context_length = 32768
+kv_cache_dtype = "fp8_e4m3"
+tensor_parallel_size = 1
+data_parallel_size = 1
+mem_fraction_static = 0.35          # GPU 1 佔 34GB (9GB 權重 + 25GB KV Cache)，仍留 62GB 給同事
+max_num_seqs = 128
+idle_seconds = 300
+reasoning_parser = "qwen3"
+tool_call_parser = "qwen3_coder"
+aliases = ["qwen3.5-9b"]
+vllm_args = [
+    "--device-ids", "1",            # 鎖定 GPU 1，與 Coding Agent 物理隔離
+    "--enable-chunked-prefill",
+    "--enable-prefix-caching",
+    "--attention-backend", "flashinfer",
+    "--enable-flashinfer-autotune",
+    "--async-scheduling",
+    "--speculative-config", '{"method": "mtp", "num_speculative_tokens": 2}',
+]
+
+["qwen3.6-27b"]
+model_path = "Qwen/Qwen3.6-27B-FP8"
+context_length = 262144
+kv_cache_dtype = "fp8_e4m3"
+tensor_parallel_size = 1
+data_parallel_size = 1
+mem_fraction_static = 0.45
+max_num_seqs = 16
+max_num_batched_tokens = 2048
+idle_seconds = 0.0
+aliases = ["qwen3.6-27b-fp8"]
+vllm_args = [
+    "--device-ids", "0",
+    "--enable-chunked-prefill",
+    "--enable-prefix-caching",
+    "--attention-backend", "flashinfer",
+    "--enable-flashinfer-autotune",
+    "--async-scheduling",
+    "--speculative-config", '{"method": "mtp", "num_speculative_tokens": 2}',
+]

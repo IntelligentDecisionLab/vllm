@@ -1,74 +1,190 @@
-# SGLang inference service
+# vLLM multi-model gateway
 
-這個專案提供一個單一的 OpenAI-compatible endpoint，預設運行在 `11432`。它會讀取相鄰 `../llama.cpp/models-preset.ini` 的 named presets，並在收到請求時啟動對應的 SGLang backend。
+這個專案提供單一 OpenAI-compatible endpoint（預設 `:11432`），並依 repo 內的 `models.toml` 按需啟動多個獨立 vLLM backend。每個 resident model 有自己的 private port、process、request lease 與 idle policy；目前預設最多同時常駐兩個模型。
 
-目前會暴露以下模型名稱：
+目前 catalog 包含：
 
-- `qwen3.8-27b`（預設）
-- `qwen3.6-27b`
-- `qwen3.6-35b-a3b`
-- `llama3.2-1b`
+- `qwen3.8-27b`（預設，`Qwen/Qwen3.8-27B-FP8`）
+- `qwen3.6-27b`（`Qwen/Qwen3.6-27B-FP8`）
 
-服務預設只常駐一個 backend。這讓所有模型都能透過相同的 API 使用，同時避免 27B/35B 權重一起佔滿 VRAM；同一個已載入模型的請求仍由 SGLang scheduler 做高併發 batching。切換模型時，服務會等目前請求完成、停止舊 backend，再啟動新模型。可用 `--idle-seconds` 在閒置時自動釋放 VRAM。
+Gateway 會把 alias canonicalize，再將 request 的 `model` 改成 canonical ID 後送往對應 backend。同模型請求共用同一個 vLLM scheduler；不同模型可同時載入並平行服務。
 
-## 安裝與啟動
-
-本機有 NVIDIA GPU 時：
+## 安裝
 
 ```bash
-uv sync --extra runtime
-uv run python main.py --preload
+uv sync --extra runtime --extra test
 ```
 
-`--preload` 會在 `11432` 綁定前先載入 preset 排序中的第一個生成模型 `qwen3.8-27b`。不加此選項時，服務會立即啟動，但第一個使用某模型的 request 會負責載入它；也可以用 `--default-model llama3.2-1b` 選擇較小的預設模型。
+目前 runtime contract 與 lock file 使用 vLLM 0.27.1。Gateway 本身可在沒有 GPU runtime 的環境執行單元測試；實際載入模型仍需要相容的 NVIDIA/CUDA 環境。
 
-這台機器有兩張 GPU，因此預設使用 `--tensor-parallel-size 2`、`--data-parallel-size 1`：同一份模型跨兩張 GPU 做 TP，對 27B 與長 context 較安全。若模型能完整放進單卡，可改成 DP2 來提高獨立 request 的吞吐量：
+## Model catalog
+
+`models.toml` 支援全域 default 與 per-model override。Repository 目前的主要設定如下：
+
+```toml
+[default]
+context_length = 262144
+kv_cache_dtype = "fp8_e4m3"
+tensor_parallel_size = 2
+data_parallel_size = 1
+mem_fraction_static = 0.26
+max_num_seqs = 64
+idle_seconds = 0.0
+reasoning_parser = "qwen3"
+tool_call_parser = "qwen3_coder"
+
+["qwen3.8-27b"]
+model_path = "Qwen/Qwen3.8-27B-FP8"
+default = true
+aliases = ["qwen3.8-27b-fp8"]
+
+["qwen3.6-27b"]
+model_path = "Qwen/Qwen3.6-27B-FP8"
+reasoning = "off"
+aliases = ["qwen3.6-27b-fp8"]
+```
+
+`model_path` 可以是 Hugging Face repo ID，或包含 Transformers/Safetensors 權重的本機目錄。Canonical name、normalized name、alias、model path 與 HF source 若跨模型衝突，gateway 會在啟動時明確報錯，不會靜默 routing 到錯誤模型。
+
+`reasoning = "off"` 會在 chat request 未自行指定時加入：
+
+```json
+{"chat_template_kwargs":{"enable_thinking":false}}
+```
+
+## 啟動 gateway
+
+直接執行：
 
 ```bash
-uv run python main.py --tensor-parallel-size 1
-uv run python main.py --tensor-parallel-size 1 --data-parallel-size 2
-uv run python main.py --default-model qwen3.8-27b --preload
+uv run python -m sglang_service
 ```
 
-wrapper 也支援相同設定：`SGLANG_TP_SIZE=1 SGLANG_DP_SIZE=2 ~/.local/bin/sglang start`。
+預載預設模型：
 
-啟動器預設使用 `--cuda-graph-backend-prefill tc_piecewise`，以避開這台 Blackwell GPU 上預設 prefill FlashInfer graph 的相容性問題；可在 `~/.local/bin/sglang` 的設定區塊修改 `CUDA_GRAPH_BACKEND_PREFILL`，或用 `SGLANG_CUDA_GRAPH_BACKEND_PREFILL` 暫時覆寫。
+```bash
+uv run python -m sglang_service --preload
+```
 
-同理，預設 `ATTENTION_BACKEND=triton`；若升級 runtime 後想改回其他 kernel，可直接修改 wrapper 設定或使用 `SGLANG_ATTENTION_BACKEND`。
+同時預載多個模型：
 
-wrapper 也會預設使用 `/usr/local/cuda/bin`（本機指向 CUDA 13.2）編譯 SGLang 的 JIT kernel；若 CUDA 安裝位置不同，可修改 `CUDA_HOME` 或設定 `SGLANG_CUDA_HOME`。
+```bash
+uv run python -m sglang_service \
+  --preload-model qwen3.8-27b \
+  --preload-model qwen3.6-27b
+```
 
-如果 SGLang 是在另一個 virtualenv/container 安裝的，請用該環境的 Python 啟動 `main.py`；gateway 會用同一個 Python 執行 `python -m sglang.launch_server`。
+重要選項：
+
+```text
+--backend-port 30000          private port range 起點
+--backend-port-count 64       allocator 可使用的 port 數
+--max-loaded-models 2         resident/loading backend 硬上限
+--idle-seconds 0              global idle unload；0 表示保持載入
+--startup-timeout 900         backend model load timeout
+--backend-shutdown-timeout 30 request drain/process stop timeout
+--tensor-parallel-size N      明確覆寫所有 model 的 TP
+--data-parallel-size N        明確覆寫所有 model 的 DP
+--vllm-arg ARG                額外安全的 vLLM argument，可重複
+```
+
+Identity、network 與 catalog 管理的 resource flags 不能透過 `--vllm-arg` 覆寫；例如 `--port`、`--model`、`--served-model-name`、TP/DP、memory、context 與 KV cache。這類設定應使用 catalog 或 gateway 的正式 CLI option。
+
+## `~/.local/bin/vllm` 管理工具
+
+Companion script 預設使用 `/home/sam/Projects/vllm`，也可設定 `VLLM_PROJECT_DIR`。它只管理 gateway PID；backend children 全由 `ModelManager` 在 graceful shutdown 中停止，不會使用 `fuser`、`pgrep` 或 port regex 猜測 process ownership。
+
+```bash
+vllm start
+vllm status
+vllm models
+vllm load qwen3.8-27b
+vllm load qwen3.6-27b
+vllm unload qwen3.8-27b
+vllm restart
+vllm stop
+vllm logs 200
+vllm download
+```
+
+`start` 會等待 `/health`；設定 preload 時會進一步等待 `/ready`。`unload` 若模型仍有 active request 會回 409，不會強制中斷請求。
+
+常用環境變數：
+
+```text
+VLLM_PROJECT_DIR
+VLLM_CONFIG_FILE
+VLLM_SERVICE_HOST / VLLM_SERVICE_PORT
+VLLM_BACKEND_PORT / VLLM_BACKEND_PORT_COUNT
+VLLM_MAX_LOADED_MODELS
+VLLM_PRELOAD / VLLM_PRELOAD_MODELS（逗號分隔）
+VLLM_MODEL_IDLE_SECONDS
+VLLM_TP_SIZE / VLLM_DP_SIZE
+VLLM_GPU_MEMORY_UTILIZATION
+VLLM_PID_FILE / VLLM_LOG_FILE
+```
+
+舊的 `SGLANG_CONFIG_FILE`、`SGLANG_MODELS_FILE`、`SGLANG_DIR` 等同義環境變數仍保留為低優先級相容 fallback；新設定應使用 `VLLM_*`。
 
 ## API
 
+Liveness 與 resident 狀態：
+
 ```bash
 curl http://127.0.0.1:11432/health
+curl http://127.0.0.1:11432/ready
 curl http://127.0.0.1:11432/v1/models
+```
 
+- `/health`：gateway liveness、`loaded_models`、每個 backend state/port/PID/active requests 與 capacity。
+- `/ready`：至少一個 backend 已完成嚴格 readiness 時回 200，否則回 503。
+- `/v1/models`：完整 catalog；每個 model 的 `loaded` 代表該 backend 正處於 ready。
+
+Inference：
+
+```bash
 curl http://127.0.0.1:11432/v1/chat/completions \
   -H 'content-type: application/json' \
   -d '{
     "model": "qwen3.8-27b",
-    "messages": [{"role": "user", "content": "用一句話介紹 SGLang"}],
+    "messages": [{"role": "user", "content": "用一句話介紹 vLLM"}],
     "temperature": 0.2,
     "max_tokens": 128,
     "stream": true
   }'
 ```
 
-所有沒有指定 `model` 的 JSON request 都使用預設的生成模型。也可以直接使用 OpenAI SDK，把 `base_url` 設為 `http://127.0.0.1:11432/v1`。
+未提供 `model` 的 JSON request 使用 catalog default。OpenAI SDK 可將 `base_url` 設為 `http://127.0.0.1:11432/v1`。
 
-## 模型與相容性
-
-gateway 會依照 preset 的 `hf-repo`/`hf-file` 從 Hugging Face cache 解析 GGUF；本機 `model = ...` preset 則直接使用該路徑。SGLang backend 以 `--load-format gguf` 啟動，embedding preset 會加上 `--is-embedding`。
-
-`qwen3.5-9b-mtp` 的 `spec-type = draft-mtp` metadata 會保留在 catalog，但目前 gateway 不會把 llama.cpp 專用的 MTP 參數假裝成 SGLang speculative decoding。另有 `qwen3.5-9b` 非 MTP preset，指向官方原生 `Qwen/Qwen3.5-9B` Transformers 權重；可用 `--default-model qwen3.5-9b` 將它設為預設模型。先前下載的 `unsloth/Qwen3.5-9B-GGUF` Q8 檔案仍保留在 Hugging Face cache，但目前 SGLang GGUF loader 不支援其 `qwen35` architecture。若原生模型需要額外參數，可用 `--sglang-arg` 傳入，例如：
-
-`reasoning = off` preset 會在 chat request 沒有明確指定時自動加入 `chat_template_kwargs.enable_thinking = false`。
+本機管理 API（僅接受 loopback client）：
 
 ```bash
-uv run python main.py --sglang-arg=--disable-cuda-graph
+curl http://127.0.0.1:11432/admin/models
+curl -X POST http://127.0.0.1:11432/admin/models/qwen3.8-27b/load
+curl -X POST http://127.0.0.1:11432/admin/models/qwen3.8-27b/unload
 ```
 
-「暴露所有 preset」與「SGLang 能載入每一個 GGUF architecture」是兩件事：如果目前安裝的 SGLang 尚未支援某個 GGUF architecture，該模型會在第一次請求時回傳 `503 backend_unavailable`，其他模型仍可使用。服務會保留完整 preset catalog，方便在升級 SGLang 後直接重試。
+熱重載設定檔：
+
+```bash
+curl -X POST http://127.0.0.1:11432/admin/reload
+```
+
+重新解析 `models.toml` 並原子替換 catalog，不需重啟服務：新增的模型在首次請求時懶載入；spec 變更或被移除的模型其 backend 會 drain 後停止；完全相同且載入中的模型不受影響（process 不重啟）。解析失敗回 400，舊設定繼續服務。回應含 `added` / `removed` / `updated` / `kept_loaded` diff 摘要。若啟動時有指定 `--default-model`，reload 不會改變 default model。
+
+## Backend lifecycle 與安全性
+
+- Backend port 由 canonical model name 穩定映射到 bounded private range；collision 時 deterministic probing。
+- 外部程序占用 port 時 gateway 只跳過或報錯，絕不 kill 該程序。
+- Backend 只有在 `/health == 200`，且 `/v1/models == 200` 並包含預期 canonical model 時才進入 ready。
+- 同模型 concurrent first requests 共用一個 startup task；不同模型在 capacity 允許時可並行載入。
+- Capacity 滿時只會 LRU 卸載沒有 active request 的 backend；若所有 backend 都 active/loading，新的 model load 回 503。
+- Shutdown 與 idle unload 先進入 draining；等待 active leases 完成後才停止 gateway-owned process group。
+
+## 測試
+
+```bash
+uv run --extra test python -m pytest -q
+```
+
+GPU smoke test 應在確認硬體容量後執行。若模型載入因 VRAM 或 runtime flag 失敗，先查看 `vllm logs` 與 `/health` 的 backend error diagnostics，不要在未驗證前任意改動 context、KV dtype 或 memory fraction。
