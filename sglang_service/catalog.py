@@ -122,6 +122,7 @@ class ModelSpec:
     reasoning_parser: str | None = None
     tool_call_parser: str | None = None
     chat_template: str | None = None
+    attention_backend: str | None = None
     vllm_args: tuple[str, ...] = ()
     is_default: bool = False
     aliases: tuple[str, ...] = ()
@@ -356,6 +357,7 @@ class ModelCatalog:
                 reasoning_parser=merged.get("reasoning_parser") or merged.get("reasoning-parser"),
                 tool_call_parser=merged.get("tool_call_parser") or merged.get("tool-call-parser"),
                 chat_template=merged.get("chat_template") or merged.get("chat-template"),
+                attention_backend=merged.get("attention_backend") or merged.get("attention-backend"),
                 vllm_args=vllm_args,
                 is_default=_truthy(merged.get("default") or merged.get("is_default")),
                 aliases=aliases,

@@ -12,10 +12,10 @@ max_num_batched_tokens = 2048
 idle_seconds = 1800
 reasoning_parser = "qwen3"
 tool_call_parser = "qwen3_coder"
+attention_backend = "flashinfer"
 vllm_args = [
     "--enable-chunked-prefill",
     "--enable-prefix-caching",
-    "--attention-backend", "flashinfer",
     "--enable-flashinfer-autotune",
     "--async-scheduling",
     "--speculative-config", '{"method": "mtp", "num_speculative_tokens": 2}',
@@ -39,7 +39,6 @@ vllm_args = [
     "--device-ids", "0",            # 鎖定 GPU 0，完全零跨卡通訊
     "--enable-chunked-prefill",
     "--enable-prefix-caching",
-    "--attention-backend", "flashinfer",
     "--enable-flashinfer-autotune",
     "--async-scheduling",
     "--speculative-config", '{"method": "mtp", "num_speculative_tokens": 2}',
@@ -62,7 +61,6 @@ vllm_args = [
     "--device-ids", "1",            # 鎖定 GPU 1，與 Coding Agent 物理隔離
     "--enable-chunked-prefill",
     "--enable-prefix-caching",
-    "--attention-backend", "flashinfer",
     "--enable-flashinfer-autotune",
     "--async-scheduling",
     "--speculative-config", '{"method": "mtp", "num_speculative_tokens": 2}',
@@ -83,7 +81,6 @@ vllm_args = [
     "--device-ids", "0",
     "--enable-chunked-prefill",
     "--enable-prefix-caching",
-    "--attention-backend", "flashinfer",
     "--enable-flashinfer-autotune",
     "--async-scheduling",
     "--speculative-config", '{"method": "mtp", "num_speculative_tokens": 2}',

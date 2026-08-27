@@ -4,10 +4,17 @@
 
 目前 catalog 包含：
 
-- `qwen3.8-27b`（預設，`Qwen/Qwen3.8-27B-FP8`）
-- `qwen3.6-27b`（`Qwen/Qwen3.6-27B-FP8`）
+- `qwen3.8-27b`（預設，`Qwen/Qwen3.8-27B-FP8`，GPU 0）
+- `qwen3.5-9b`（`Qwen/Qwen3.5-9B`，GPU 1）
+- `qwen3.6-27b`（`Qwen/Qwen3.6-27B-FP8`，GPU 0）
 
 Gateway 會把 alias canonicalize，再將 request 的 `model` 改成 canonical ID 後送往對應 backend。同模型請求共用同一個 vLLM scheduler；不同模型可同時載入並平行服務。
+
+詳細設計與維護方式：
+
+- [Gateway 架構](docs/architecture.md)
+- [設定與檔案放置](docs/configuration.md)
+- [開發與驗證](docs/development.md)
 
 ## 安裝
 
@@ -19,32 +26,45 @@ uv sync --extra runtime --extra test
 
 ## Model catalog
 
-`models.toml` 支援全域 default 與 per-model override。Repository 目前的主要設定如下：
+`models.toml` 支援全域 default 與 per-model override。Repository 目前的核心設定如下；完整 GPU placement 與 `vllm_args` 以 [`models.toml`](models.toml) 為準：
 
 ```toml
 [default]
 context_length = 262144
 kv_cache_dtype = "fp8_e4m3"
-tensor_parallel_size = 2
+tensor_parallel_size = 1
 data_parallel_size = 1
-mem_fraction_static = 0.26
-max_num_seqs = 64
-idle_seconds = 0.0
+mem_fraction_static = 0.45
+max_num_seqs = 16
+max_num_batched_tokens = 2048
+idle_seconds = 1800
 reasoning_parser = "qwen3"
 tool_call_parser = "qwen3_coder"
+attention_backend = "flashinfer"
 
 ["qwen3.8-27b"]
 model_path = "Qwen/Qwen3.8-27B-FP8"
+idle_seconds = 0.0
 default = true
 aliases = ["qwen3.8-27b-fp8"]
 
+["qwen3.5-9b"]
+model_path = "Qwen/Qwen3.5-9B"
+context_length = 32768
+mem_fraction_static = 0.35
+max_num_seqs = 128
+idle_seconds = 300
+aliases = ["qwen3.5-9b"]
+
 ["qwen3.6-27b"]
 model_path = "Qwen/Qwen3.6-27B-FP8"
-reasoning = "off"
+idle_seconds = 0.0
 aliases = ["qwen3.6-27b-fp8"]
 ```
 
 `model_path` 可以是 Hugging Face repo ID，或包含 Transformers/Safetensors 權重的本機目錄。Canonical name、normalized name、alias、model path 與 HF source 若跨模型衝突，gateway 會在啟動時明確報錯，不會靜默 routing 到錯誤模型。
+
+`attention_backend` 是 catalog 的正式欄位；不要把 `--attention-backend` 放入 `vllm_args`，因為 gateway 會拒絕其中的受管理參數。
 
 `reasoning = "off"` 會在 chat request 未自行指定時加入：
 

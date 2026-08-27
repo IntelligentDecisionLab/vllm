@@ -792,8 +792,9 @@ class ModelManager:
             command.extend(("--enable-auto-tool-choice", "--tool-call-parser", spec.tool_call_parser))
         if spec.chat_template:
             command.extend(("--chat-template", spec.chat_template))
-        if self.attention_backend:
-            command.extend(("--attention-backend", self.attention_backend))
+        attention_backend = self.attention_backend or spec.attention_backend
+        if attention_backend:
+            command.extend(("--attention-backend", attention_backend))
 
         override_args: dict[str, Any] = {}
         if spec.rope_scaling or spec.rope_scale is not None or spec.yarn_orig_ctx is not None:

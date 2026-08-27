@@ -30,18 +30,19 @@ def test_loads_models_toml() -> None:
     assert not qwen38.is_gguf
     assert qwen38.context_length == 262144
     assert qwen38.kv_cache_dtype == "fp8_e4m3"
-    assert qwen38.tensor_parallel_size == 2
+    assert qwen38.tensor_parallel_size == 1
     assert qwen38.data_parallel_size == 1
     assert qwen38.idle_seconds == 0.0
+    assert qwen38.attention_backend == "flashinfer"
 
     # Qwen 3.6 FP8
     qwen36 = catalog.get("qwen3.6-27b")
     assert qwen36.model_path == "Qwen/Qwen3.6-27B-FP8"
     assert not qwen36.is_gguf
-    assert qwen36.reasoning == "off"
+    assert qwen36.reasoning is None
     assert qwen36.context_length == 262144
     assert qwen36.kv_cache_dtype == "fp8_e4m3"
-    assert qwen36.tensor_parallel_size == 2
+    assert qwen36.tensor_parallel_size == 1
     assert qwen36.data_parallel_size == 1
 
 
@@ -67,11 +68,12 @@ def test_backend_command_generation_fp8() -> None:
 
     assert "--load-format" not in command
     assert command[command.index("--model") + 1] == "Qwen/Qwen3.8-27B-FP8"
-    assert command[command.index("--tensor-parallel-size") + 1] == "2"
+    assert command[command.index("--tensor-parallel-size") + 1] == "1"
     assert command[command.index("--data-parallel-size") + 1] == "1"
     assert command[command.index("--kv-cache-dtype") + 1] == "fp8_e4m3"
     assert command[command.index("--max-model-len") + 1] == "262144"
     assert command[command.index("--reasoning-parser") + 1] == "qwen3"
+    assert command[command.index("--attention-backend") + 1] == "flashinfer"
     assert "--enable-auto-tool-choice" in command
     assert command[command.index("--tool-call-parser") + 1] == "qwen3_coder"
     assert command[command.index("--served-model-name") + 1] == "qwen3.8-27b"
@@ -169,7 +171,7 @@ def test_model_spec_public_dict() -> None:
     assert metadata["format"] == "safetensors"
     assert metadata["source"] == "Qwen/Qwen3.8-27B-FP8"
     assert metadata["kv_cache_dtype"] == "fp8_e4m3"
-    assert metadata["tensor_parallel_size"] == 2
+    assert metadata["tensor_parallel_size"] == 1
     assert metadata["data_parallel_size"] == 1
 
 
@@ -236,7 +238,7 @@ def test_apply_model_defaults() -> None:
 
     payload = {"messages": [{"role": "user", "content": "Hello"}]}
     _apply_model_defaults(payload, qwen36)
-    assert payload.get("chat_template_kwargs") == {"enable_thinking": False}
+    assert "chat_template_kwargs" not in payload
 
     qwen38 = catalog.get("qwen3.8-27b")
     payload2 = {"messages": [{"role": "user", "content": "Hello"}]}
@@ -274,6 +276,7 @@ def test_custom_toml_structures() -> None:
     [default]
     kv_cache_dtype = "fp8_e5m2"
     tensor_parallel_size = 4
+    attention_backend = "flashinfer"
 
     [models.model_a]
     model_path = "/tmp/local_weights"
@@ -297,6 +300,7 @@ def test_custom_toml_structures() -> None:
         assert a.kv_cache_dtype == "fp8_e5m2"
         assert a.tensor_parallel_size == 4
         assert a.context_length == 65536
+        assert a.attention_backend == "flashinfer"
         assert a.vllm_args == ("--enforce-eager", "--gpu-memory-utilization", "0.85")
 
         b = catalog.get("model_b")
