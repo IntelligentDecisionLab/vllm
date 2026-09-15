@@ -158,6 +158,13 @@ class ModelManager:
         "--chat-template",
         "--attention-backend",
         "--hf-overrides",
+        "--device-ids",
+        "--async-scheduling",
+        "--enable-flashinfer-autotune",
+        "--speculative-config",
+        "--enable-chunked-prefill",
+        "--enable-prefix-caching",
+        "--enable-auto-tool-choice",
     }
 
     def __init__(
@@ -225,6 +232,8 @@ class ModelManager:
                 continue
             flag = arg.split("=", 1)[0]
             normalized_flag = flag.replace("_", "-")
+            if normalized_flag.startswith("--no-"):
+                normalized_flag = "--" + normalized_flag.removeprefix("--no-")
             if normalized_flag in cls._PROTECTED_VLLM_FLAGS:
                 raise ValueError(f"{source} cannot override gateway-managed option {flag}")
 

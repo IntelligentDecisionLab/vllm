@@ -462,3 +462,23 @@ async def test_reload_recomputes_default_max_loaded_models_only() -> None:
     await pinned.reload_catalog(one_model)
     assert pinned.max_loaded_models == 4
     await pinned.shutdown()
+
+
+@pytest.mark.parametrize("flag", [
+    "device-ids", "async-scheduling", "enable-flashinfer-autotune", "speculative-config",
+    "enable-chunked-prefill", "enable-prefix-caching", "enable-auto-tool-choice",
+])
+@pytest.mark.parametrize("spelling", ["hyphen", "underscore", "negated", "negated_underscore"])
+def test_new_managed_flags_reject_all_spellings(flag: str, spelling: str) -> None:
+    if spelling.startswith("negated"):
+        flag = "no-" + flag
+    if "underscore" in spelling:
+        flag = flag.replace("-", "_")
+    argument = f"--{flag}=true"
+    spec = ModelSpec(name="model-a", model_path="org/a", vllm_args=(argument,))
+    catalog = ModelCatalog([spec], Path("models.toml"))
+    manager = ModelManager(catalog)
+    with pytest.raises(ValueError, match="gateway-managed"):
+        manager._command(spec, spec.model_path, 30000)
+    with pytest.raises(ValueError, match="gateway-managed"):
+        ModelManager(catalog, vllm_args=(argument,))

@@ -833,6 +833,33 @@ print("OK")
         path.unlink()
 
 
+@pytest.mark.parametrize("name,tokens,devices", [("qwen3.8-27b", 3, None), ("qwen3.5-9b", 2, (1,))])
+def test_migrated_catalog_runtime_fields(name: str, tokens: int, devices: tuple[int, ...] | None) -> None:
+    catalog = ModelCatalog.from_toml_file(MODELS_TOML)
+    spec = catalog.get(name)
+    assert spec.gpu_memory_utilization == 0.35
+    assert spec.device_ids == devices
+    assert spec.async_scheduling is True
+    assert spec.flashinfer_autotune is True
+    assert spec.enable_prefix_caching is True
+    assert spec.speculative_method == "mtp"
+    assert spec.num_speculative_tokens == tokens
+    assert spec.vllm_args == ()
+    command = ModelManager(catalog)._command(spec, spec.model_path, 30000)
+    assert command[command.index("--gpu-memory-utilization") + 1] == "0.35"
+    assert "--async-scheduling" in command
+    assert "--enable-flashinfer-autotune" in command
+    assert "--enable-prefix-caching" in command
+    assert "--enable-chunked-prefill" not in command
+    assert json.loads(command[command.index("--speculative-config") + 1]) == {
+        "method": "mtp", "num_speculative_tokens": tokens,
+    }
+    if devices is None:
+        assert "--device-ids" not in command
+    else:
+        assert command[command.index("--device-ids") + 1] == "1"
+
+
 def test_typed_runtime_defaults_and_overrides(tmp_path: Path) -> None:
     path = tmp_path / "models.toml"
     path.write_text('''
