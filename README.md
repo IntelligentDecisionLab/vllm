@@ -26,7 +26,7 @@ uv sync --extra runtime --extra test
 
 ## Model catalog
 
-`models.toml` 支援全域 default 與 per-model override。Repository 目前的核心設定如下；完整 GPU placement 與 `vllm_args` 以 [`models.toml`](models.toml) 為準：
+`models.toml` 支援全域 default 與 per-model override。Repository 目前的核心設定如下；完整 GPU placement 與 runtime 欄位以 [`models.toml`](models.toml) 為準：
 
 ```toml
 [default]
@@ -34,7 +34,7 @@ context_length = 262144
 kv_cache_dtype = "fp8_e4m3"
 tensor_parallel_size = 1
 data_parallel_size = 1
-mem_fraction_static = 0.45
+gpu_memory_utilization = 0.45
 max_num_seqs = 16
 max_num_batched_tokens = 2048
 idle_seconds = 1800
@@ -51,7 +51,7 @@ aliases = ["qwen3.8-27b-fp8"]
 ["qwen3.5-9b"]
 model_path = "Qwen/Qwen3.5-9B"
 context_length = 32768
-mem_fraction_static = 0.35
+gpu_memory_utilization = 0.30
 max_num_seqs = 128
 idle_seconds = 300
 aliases = ["qwen3.5-9b"]
