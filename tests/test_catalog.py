@@ -831,3 +831,115 @@ print("OK")
         assert "OK" in res.stdout
     finally:
         path.unlink()
+
+
+def test_typed_runtime_defaults_and_overrides(tmp_path: Path) -> None:
+    path = tmp_path / "models.toml"
+    path.write_text('''
+[default]
+device_ids = [0, 1]
+async_scheduling = true
+flashinfer_autotune = true
+enable_prefix_caching = true
+speculative_method = "mtp"
+num_speculative_tokens = 2
+[inherited]
+model_path = "org/inherited"
+[overridden]
+model_path = "org/overridden"
+device_ids = [1]
+async_scheduling = false
+flashinfer_autotune = false
+enable_prefix_caching = false
+speculative_method = "ngram"
+num_speculative_tokens = 3
+''')
+    catalog = ModelCatalog.from_toml_file(path)
+    manager = ModelManager(catalog)
+    inherited = catalog.get("inherited")
+    assert inherited.device_ids == (0, 1)
+    assert inherited.async_scheduling is True
+    assert inherited.flashinfer_autotune is True
+    assert inherited.enable_prefix_caching is True
+    assert inherited.speculative_method == "mtp"
+    assert inherited.num_speculative_tokens == 2
+    command = manager._command(inherited, inherited.model_path, 30000)
+    assert command[command.index("--device-ids") + 1] == "0,1"
+    overridden = catalog.get("overridden")
+    assert overridden.device_ids == (1,)
+    assert overridden.async_scheduling is False
+    assert overridden.flashinfer_autotune is False
+    assert overridden.enable_prefix_caching is False
+    assert overridden.speculative_method == "ngram"
+    assert overridden.num_speculative_tokens == 3
+    command = manager._command(overridden, overridden.model_path, 30001)
+    assert command[command.index("--device-ids") + 1] == "1"
+    for flag in ("async-scheduling", "enable-flashinfer-autotune", "enable-prefix-caching"):
+        assert f"--no-{flag}" in command
+        assert f"--{flag}" not in command
+    assert json.loads(command[command.index("--speculative-config") + 1]) == {
+        "method": "ngram", "num_speculative_tokens": 3,
+    }
+
+
+@pytest.mark.parametrize("method", [None, "mtp"])
+def test_unset_runtime_fields_and_optional_speculative_tokens(tmp_path: Path, method: str | None) -> None:
+    path = tmp_path / "models.toml"
+    path.write_text('[model]\nmodel_path = "org/model"\n' + (f'speculative_method = "{method}"\n' if method else ""))
+    catalog = ModelCatalog.from_toml_file(path)
+    spec = catalog.default
+    assert spec.device_ids is None
+    assert spec.async_scheduling is None
+    assert spec.flashinfer_autotune is None
+    assert spec.enable_prefix_caching is None
+    assert spec.num_speculative_tokens is None
+    assert spec.speculative_method == method
+    command = ModelManager(catalog)._command(spec, spec.model_path, 30000)
+    for flag in ("device-ids", "async-scheduling", "enable-flashinfer-autotune", "enable-prefix-caching"):
+        assert f"--{flag}" not in command
+        assert f"--no-{flag}" not in command
+    if method:
+        assert json.loads(command[command.index("--speculative-config") + 1]) == {"method": method}
+    else:
+        assert "--speculative-config" not in command
+    assert command[command.index("--gpu-memory-utilization") + 1] == "0.9"
+
+
+@pytest.mark.parametrize("defaults,model_values,expected", [
+    ("", "mem_fraction_static = 0.35", 0.35),
+    ("mem_fraction_static = 0.45", "", 0.45),
+    ("gpu_memory_utilization = 0.45", "mem_fraction_static = 0.35", 0.35),
+    ("mem_fraction_static = 0.45", "gpu_memory_utilization = 0.35", 0.35),
+    ("", "mem_fraction_static = 0.45\ngpu_memory_utilization = 0.35", 0.35),
+    ("mem_fraction_static = 0.45\ngpu_memory_utilization = 0.35", "", 0.35),
+])
+def test_gpu_memory_deprecated_alias_precedence(tmp_path: Path, defaults: str, model_values: str, expected: float) -> None:
+    path = tmp_path / "models.toml"
+    path.write_text(f'[default]\n{defaults}\n[model]\nmodel_path = "org/model"\n{model_values}\n')
+    catalog = ModelCatalog.from_toml_file(path)
+    spec = catalog.default
+    assert spec.gpu_memory_utilization == expected
+    command = ModelManager(catalog)._command(spec, spec.model_path, 30000)
+    assert command[command.index("--gpu-memory-utilization") + 1] == str(expected)
+    command = ModelManager(catalog, gpu_memory_utilization=0.8)._command(spec, spec.model_path, 30000)
+    assert command[command.index("--gpu-memory-utilization") + 1] == "0.8"
+    assert "gpu_memory_utilization" not in spec.public_dict()["metadata"]
+    assert "mem_fraction_static" not in spec.public_dict()["metadata"]
+
+
+@pytest.mark.parametrize("key,value", [
+    ("device_ids", '"0,1"'), ("device_ids", "[true]"), ("device_ids", "[0.5]"),
+    ("async_scheduling", '"false"'), ("async_scheduling", "1"),
+    ("flashinfer_autotune", '"true"'), ("flashinfer_autotune", "0"),
+    ("enable_prefix_caching", '"true"'), ("enable_prefix_caching", "1"),
+    ("speculative_method", "true"), ("speculative_method", "2"),
+    ("num_speculative_tokens", "true"), ("num_speculative_tokens", "2.5"),
+    ("num_speculative_tokens", '"2"'),
+])
+@pytest.mark.parametrize("section", ["default", "model"])
+def test_runtime_fields_reject_invalid_toml_types(tmp_path: Path, key: str, value: str, section: str) -> None:
+    path = tmp_path / "models.toml"
+    entry = f"{key} = {value}\n"
+    path.write_text(f'[default]\n{entry if section == "default" else ""}[model]\nmodel_path = "org/model"\n{entry if section == "model" else ""}')
+    with pytest.raises(ValueError, match=key):
+        ModelCatalog.from_toml_file(path)

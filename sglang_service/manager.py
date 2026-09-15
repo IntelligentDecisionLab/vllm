@@ -739,7 +739,7 @@ class ModelManager:
         gpu_mem = (
             self.gpu_memory_utilization
             if self.gpu_memory_utilization is not None
-            else (spec.mem_fraction_static if spec.mem_fraction_static is not None else 0.90)
+            else (spec.gpu_memory_utilization if spec.gpu_memory_utilization is not None else 0.90)
         )
         max_requests = (
             self.max_num_seqs
@@ -795,6 +795,21 @@ class ModelManager:
         attention_backend = self.attention_backend or spec.attention_backend
         if attention_backend:
             command.extend(("--attention-backend", attention_backend))
+        if spec.device_ids is not None:
+            command.extend(("--device-ids", ",".join(str(device) for device in spec.device_ids)))
+        if spec.async_scheduling is not None:
+            command.append("--async-scheduling" if spec.async_scheduling else "--no-async-scheduling")
+        if spec.flashinfer_autotune is not None:
+            command.append(
+                "--enable-flashinfer-autotune" if spec.flashinfer_autotune else "--no-enable-flashinfer-autotune"
+            )
+        if spec.enable_prefix_caching is not None:
+            command.append("--enable-prefix-caching" if spec.enable_prefix_caching else "--no-enable-prefix-caching")
+        if spec.speculative_method is not None:
+            speculative_config: dict[str, Any] = {"method": spec.speculative_method}
+            if spec.num_speculative_tokens is not None:
+                speculative_config["num_speculative_tokens"] = spec.num_speculative_tokens
+            command.extend(("--speculative-config", json.dumps(speculative_config)))
 
         override_args: dict[str, Any] = {}
         if spec.rope_scaling or spec.rope_scale is not None or spec.yarn_orig_ctx is not None:

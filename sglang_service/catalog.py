@@ -106,7 +106,13 @@ class ModelSpec:
     kv_cache_dtype: str | None = None
     tensor_parallel_size: int | None = None
     data_parallel_size: int | None = None
-    mem_fraction_static: float | None = None
+    gpu_memory_utilization: float | None = None
+    device_ids: tuple[int, ...] | None = None
+    async_scheduling: bool | None = None
+    flashinfer_autotune: bool | None = None
+    enable_prefix_caching: bool | None = None
+    speculative_method: str | None = None
+    num_speculative_tokens: int | None = None
     max_num_seqs: int | None = None
     max_num_batched_tokens: int | None = None
     embeddings: bool = False
@@ -284,6 +290,24 @@ class ModelCatalog:
         specs: list[ModelSpec] = []
         for name, values in model_dicts:
             merged = {**common_without_default, **values}
+            gpu_memory_utilization = _first(values, "gpu_memory_utilization", "mem_fraction_static")
+            if gpu_memory_utilization is None:
+                gpu_memory_utilization = _first(common_without_default, "gpu_memory_utilization", "mem_fraction_static")
+            for key, expected_type in (
+                ("async_scheduling", bool),
+                ("flashinfer_autotune", bool),
+                ("enable_prefix_caching", bool),
+                ("speculative_method", str),
+                ("num_speculative_tokens", int),
+            ):
+                value = merged.get(key)
+                if value is not None and type(value) is not expected_type:
+                    raise ValueError(f"model {name!r}: {key} must be a TOML {expected_type.__name__}")
+            device_ids = merged.get("device_ids")
+            if device_ids is not None and (
+                not isinstance(device_ids, list) or any(type(item) is not int for item in device_ids)
+            ):
+                raise ValueError(f"model {name!r}: device_ids must be a TOML integer array")
             model_name = str(values.get("name") or name)
             model_path = (
                 merged.get("model_path")
@@ -337,7 +361,13 @@ class ModelCatalog:
                 ),
                 tensor_parallel_size=_int_or_none(_first(merged, "tensor_parallel_size", "tp_size", "tp")),
                 data_parallel_size=_int_or_none(_first(merged, "data_parallel_size", "dp_size", "dp")),
-                mem_fraction_static=_float_or_none(_first(merged, "mem_fraction_static", "gpu_memory_utilization")),
+                gpu_memory_utilization=_float_or_none(gpu_memory_utilization),
+                device_ids=tuple(device_ids) if device_ids is not None else None,
+                async_scheduling=merged.get("async_scheduling"),
+                flashinfer_autotune=merged.get("flashinfer_autotune"),
+                enable_prefix_caching=merged.get("enable_prefix_caching"),
+                speculative_method=merged.get("speculative_method"),
+                num_speculative_tokens=merged.get("num_speculative_tokens"),
                 max_num_seqs=_int_or_none(_first(merged, "max_num_seqs", "max_running_requests")),
                 max_num_batched_tokens=_int_or_none(_first(merged, "max_num_batched_tokens", "chunked_prefill_size")),
                 embeddings=_truthy(merged.get("embeddings") or merged.get("embedding") or merged.get("is_embedding")),
