@@ -20,7 +20,8 @@ def test_loads_models_toml() -> None:
 
     model_names = [spec.name for spec in catalog.specs]
     assert "qwen3.8-27b" in model_names
-    assert "qwen3.6-27b" in model_names
+    assert "qwen3.5-9b" in model_names
+    assert set(model_names) == {"qwen3.8-27b", "qwen3.5-9b"}
     assert catalog.default.name == "qwen3.8-27b"
 
     # Qwen 3.8 FP8
@@ -30,20 +31,21 @@ def test_loads_models_toml() -> None:
     assert not qwen38.is_gguf
     assert qwen38.context_length == 262144
     assert qwen38.kv_cache_dtype == "fp8_e4m3"
-    assert qwen38.tensor_parallel_size == 1
+    assert qwen38.tensor_parallel_size == 2
     assert qwen38.data_parallel_size == 1
     assert qwen38.idle_seconds == 0.0
     assert qwen38.attention_backend == "flashinfer"
 
-    # Qwen 3.6 FP8
-    qwen36 = catalog.get("qwen3.6-27b")
-    assert qwen36.model_path == "Qwen/Qwen3.6-27B-FP8"
-    assert not qwen36.is_gguf
-    assert qwen36.reasoning is None
-    assert qwen36.context_length == 262144
-    assert qwen36.kv_cache_dtype == "fp8_e4m3"
-    assert qwen36.tensor_parallel_size == 1
-    assert qwen36.data_parallel_size == 1
+    # Qwen 3.5 9B
+    qwen35 = catalog.get("qwen3.5-9b")
+    assert qwen35.model_path == "Qwen/Qwen3.5-9B"
+    assert not qwen35.is_gguf
+    assert qwen35.reasoning is None
+    assert qwen35.context_length == 131072
+    assert qwen35.kv_cache_dtype == "fp8_e4m3"
+    assert qwen35.tensor_parallel_size == 1
+    assert qwen35.data_parallel_size == 1
+    assert qwen35.idle_seconds == 0.0
 
 
 def test_model_alias_and_normalization() -> None:
@@ -51,11 +53,11 @@ def test_model_alias_and_normalization() -> None:
 
     # Alias lookup
     assert catalog.get("qwen3.8-27b-fp8").name == "qwen3.8-27b"
-    assert catalog.get("qwen3.6-27b-fp8").name == "qwen3.6-27b"
+    assert catalog.get("qwen3.5-9b").name == "qwen3.5-9b"
 
     # Normalization lookup (underscores vs dashes)
     assert catalog.get("qwen3_8_27b").name == "qwen3.8-27b"
-    assert catalog.get("qwen3_6_27b").name == "qwen3.6-27b"
+    assert catalog.get("qwen3_5_9b").name == "qwen3.5-9b"
 
 
 def test_backend_command_generation_fp8() -> None:
@@ -68,7 +70,7 @@ def test_backend_command_generation_fp8() -> None:
 
     assert "--load-format" not in command
     assert command[command.index("--model") + 1] == "Qwen/Qwen3.8-27B-FP8"
-    assert command[command.index("--tensor-parallel-size") + 1] == "1"
+    assert command[command.index("--tensor-parallel-size") + 1] == "2"
     assert command[command.index("--data-parallel-size") + 1] == "1"
     assert command[command.index("--kv-cache-dtype") + 1] == "fp8_e4m3"
     assert command[command.index("--max-model-len") + 1] == "262144"
@@ -171,7 +173,7 @@ def test_model_spec_public_dict() -> None:
     assert metadata["format"] == "safetensors"
     assert metadata["source"] == "Qwen/Qwen3.8-27B-FP8"
     assert metadata["kv_cache_dtype"] == "fp8_e4m3"
-    assert metadata["tensor_parallel_size"] == 1
+    assert metadata["tensor_parallel_size"] == 2
     assert metadata["data_parallel_size"] == 1
 
 
@@ -234,10 +236,10 @@ def test_catalog_error_handling() -> None:
 
 def test_apply_model_defaults() -> None:
     catalog = ModelCatalog.from_toml_file(MODELS_TOML)
-    qwen36 = catalog.get("qwen3.6-27b")
+    qwen35 = catalog.get("qwen3.5-9b")
 
     payload = {"messages": [{"role": "user", "content": "Hello"}]}
-    _apply_model_defaults(payload, qwen36)
+    _apply_model_defaults(payload, qwen35)
     assert "chat_template_kwargs" not in payload
 
     qwen38 = catalog.get("qwen3.8-27b")
@@ -257,7 +259,7 @@ def test_app_endpoints() -> None:
         health_data = health_resp.json()
         assert health_data["status"] == "ok"
         assert "qwen3.8-27b" in health_data["models"]
-        assert "qwen3.6-27b" in health_data["models"]
+        assert "qwen3.5-9b" in health_data["models"]
 
         ready_resp = client.get("/ready")
         assert ready_resp.status_code == 503
@@ -268,7 +270,7 @@ def test_app_endpoints() -> None:
         assert models_data["object"] == "list"
         model_ids = [m["id"] for m in models_data["data"]]
         assert "qwen3.8-27b" in model_ids
-        assert "qwen3.6-27b" in model_ids
+        assert "qwen3.5-9b" in model_ids
 
 
 def test_custom_toml_structures() -> None:
@@ -358,7 +360,7 @@ def test_lookup_by_source_and_hf_repo() -> None:
     catalog = ModelCatalog.from_toml_file(MODELS_TOML)
     # Direct HF repo ID lookup
     assert catalog.get("Qwen/Qwen3.8-27B-FP8").name == "qwen3.8-27b"
-    assert catalog.get("Qwen/Qwen3.6-27B-FP8").name == "qwen3.6-27b"
+    assert catalog.get("Qwen/Qwen3.5-9B").name == "qwen3.5-9b"
 
 
 def test_default_section_isolation() -> None:
@@ -479,10 +481,15 @@ def test_app_get_single_model_endpoint() -> None:
         assert data1["metadata"]["format"] == "safetensors"
         assert data1["metadata"]["source"] == "Qwen/Qwen3.8-27B-FP8"
 
-        # Known model by alias: qwen3.6-27b-fp8
-        r2 = client.get("/v1/models/qwen3.6-27b-fp8")
+        # Known model: qwen3.5-9b
+        r2 = client.get("/v1/models/qwen3.5-9b")
         assert r2.status_code == 200
-        assert r2.json()["id"] == "qwen3.6-27b"
+        assert r2.json()["id"] == "qwen3.5-9b"
+
+        # Known model by alias: qwen3.8-27b-fp8
+        alias_resp = client.get("/v1/models/qwen3.8-27b-fp8")
+        assert alias_resp.status_code == 200
+        assert alias_resp.json()["id"] == "qwen3.8-27b"
 
         # Unknown model
         r3 = client.get("/v1/models/nonexistent-model")
@@ -579,7 +586,7 @@ def test_catalog_whitespace_model_lookup() -> None:
     assert catalog.get("").name == "qwen3.8-27b"
     # Leading/trailing whitespace in model name is handled
     assert catalog.get("  qwen3.8-27b  ").name == "qwen3.8-27b"
-    assert catalog.get("  qwen3.6-27b  ").name == "qwen3.6-27b"
+    assert catalog.get("  qwen3.5-9b  ").name == "qwen3.5-9b"
 
 
 def test_ini_preset_preserves_default() -> None:
@@ -692,9 +699,9 @@ async def test_manager_keeps_two_models_resident(monkeypatch: pytest.MonkeyPatch
 
     lease1 = await manager.acquire("qwen3.8-27b")
     lease2 = await manager.acquire("qwen3.8-27b")
-    lease3 = await manager.acquire("qwen3.6-27b")
+    lease3 = await manager.acquire("qwen3.5-9b")
 
-    assert started_backends == ["qwen3.8-27b", "qwen3.6-27b"]
+    assert started_backends == ["qwen3.8-27b", "qwen3.5-9b"]
     assert stopped_backends == []
     assert lease1.backend is lease2.backend
     assert lease1.backend is not lease3.backend
@@ -706,9 +713,9 @@ async def test_manager_keeps_two_models_resident(monkeypatch: pytest.MonkeyPatch
     await lease2.release()
     await lease3.release()
     status = await manager.health()
-    assert status["loaded_models"] == ["qwen3.6-27b", "qwen3.8-27b"]
+    assert status["loaded_models"] == ["qwen3.5-9b", "qwen3.8-27b"]
     await manager.shutdown()
-    assert sorted(stopped_backends) == ["qwen3.6-27b", "qwen3.8-27b"]
+    assert sorted(stopped_backends) == ["qwen3.5-9b", "qwen3.8-27b"]
 
 
 def test_cli_namespace_models_file() -> None:
@@ -739,11 +746,11 @@ async def test_manager_capacity_rejects_second_active_model(monkeypatch: pytest.
 
     lease = await manager.acquire("qwen3.8-27b")
     with pytest.raises(CapacityError, match="active or loading"):
-        await manager.acquire("qwen3.6-27b")
+        await manager.acquire("qwen3.5-9b")
 
     await lease.release()
-    second = await manager.acquire("qwen3.6-27b")
-    assert second.backend.spec.name == "qwen3.6-27b"
+    second = await manager.acquire("qwen3.5-9b")
+    assert second.backend.spec.name == "qwen3.5-9b"
     await second.release()
     await manager.shutdown()
 
