@@ -1,6 +1,6 @@
 # Gateway package 協作規範
 
-本檔只適用於 `sglang_service/`。先遵守 root [`AGENTS.md`](../AGENTS.md)，再套用以下局部規範。元件互動、request flow、state machine 與 reload semantics 見 [`docs/architecture.md`](../docs/architecture.md)。
+本檔只適用於 `vllm_gateway/`。先遵守 root [`AGENTS.md`](../AGENTS.md)，再套用以下局部規範。元件互動、request flow、state machine 與 reload semantics 見 [`docs/architecture.md`](../docs/architecture.md)。
 
 ## Local Architecture
 

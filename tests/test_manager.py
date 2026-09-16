@@ -6,8 +6,8 @@ from pathlib import Path
 
 import pytest
 
-from sglang_service.catalog import ModelCatalog, ModelSpec
-from sglang_service.manager import (
+from vllm_gateway.catalog import ModelCatalog, ModelSpec
+from vllm_gateway.manager import (
     Backend,
     BackendBusyError,
     BackendState,

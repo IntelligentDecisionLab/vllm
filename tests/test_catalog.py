@@ -5,10 +5,10 @@ from pathlib import Path
 import pytest
 from fastapi.testclient import TestClient
 
-from sglang_service.app import _apply_model_defaults, create_app
-from sglang_service.catalog import ModelCatalog, ModelSpec, resolve_model_path
-from sglang_service.cli import build_parser
-from sglang_service.manager import Backend, BackendLease, CapacityError, ModelManager
+from vllm_gateway.app import _apply_model_defaults, create_app
+from vllm_gateway.catalog import ModelCatalog, ModelSpec, resolve_model_path
+from vllm_gateway.cli import build_parser
+from vllm_gateway.manager import Backend, BackendLease, CapacityError, ModelManager
 
 REPO_ROOT = Path(__file__).parents[1]
 MODELS_TOML = REPO_ROOT / "models.toml"
@@ -523,7 +523,7 @@ async def test_backend_lease_async_context_manager() -> None:
     catalog = ModelCatalog.from_toml_file(MODELS_TOML)
     manager = ModelManager(catalog)
     spec = catalog.default
-    from sglang_service.manager import Backend, BackendLease
+    from vllm_gateway.manager import Backend, BackendLease
 
     backend = Backend(spec=spec, port=30000, active_requests=1)
     lease = BackendLease(manager, backend)
@@ -579,7 +579,7 @@ async def test_app_proxy_lease_cleanup_on_http_error(monkeypatch: pytest.MonkeyP
     manager = ModelManager(catalog)
     app = create_app(catalog, manager)
 
-    from sglang_service.manager import Backend
+    from vllm_gateway.manager import Backend
 
     mock_backend = Backend(spec=catalog.default, port=30000, active_requests=0)
 
@@ -611,7 +611,7 @@ async def test_app_proxy_lease_cleanup_on_unhandled_exception(monkeypatch: pytes
     manager = ModelManager(catalog)
     app = create_app(catalog, manager)
 
-    from sglang_service.manager import Backend
+    from vllm_gateway.manager import Backend
 
     mock_backend = Backend(spec=catalog.default, port=30000, active_requests=0)
 

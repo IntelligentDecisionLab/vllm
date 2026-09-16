@@ -17,12 +17,12 @@ uv sync --extra test
 ## Entry points
 
 ```bash
-uv run python -m sglang_service --help
-uv run python -m sglang_service
-uv run python -m sglang_service --preload
+uv run python -m vllm_gateway --help
+uv run python -m vllm_gateway
+uv run python -m vllm_gateway --preload
 ```
 
-`main.py` 和 `pyproject.toml` 的 `vllm-service`、`vllm-gateway` scripts 都呼叫相同的 CLI main。
+`pyproject.toml` 的 `vllm-service`、`vllm-gateway` scripts 都呼叫相同的 CLI main。
 
 ## 測試分區
 

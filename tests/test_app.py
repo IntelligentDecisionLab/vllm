@@ -7,9 +7,9 @@ from typing import Any
 import httpx
 from fastapi.testclient import TestClient
 
-from sglang_service.app import create_app
-from sglang_service.catalog import ModelCatalog, ModelSpec
-from sglang_service.manager import Backend, BackendBusyError, BackendLease, BackendState
+from vllm_gateway.app import create_app
+from vllm_gateway.catalog import ModelCatalog, ModelSpec
+from vllm_gateway.manager import Backend, BackendBusyError, BackendLease, BackendState
 
 
 class AliveProcess:

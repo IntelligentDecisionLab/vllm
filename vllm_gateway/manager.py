@@ -18,7 +18,7 @@ import httpx
 
 from .catalog import ModelCatalog, ModelSpec, resolve_model_path
 
-LOGGER = logging.getLogger("sglang_service")
+LOGGER = logging.getLogger("vllm_gateway")
 
 
 class BackendState(StrEnum):

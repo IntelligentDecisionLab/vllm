@@ -8,13 +8,13 @@
 
 ## 元件
 
-- `sglang_service/cli.py`：解析 CLI 與環境變數，載入 catalog，建立 `ModelManager` 和 FastAPI app，再啟動 Uvicorn。
-- `sglang_service/catalog.py`：把 TOML 或 legacy INI 解析成 immutable `ModelSpec`，處理 default、alias、名稱正規化與 model path。
-- `sglang_service/manager.py`：分配 private port、建立 vLLM subprocess、執行 readiness probe、管理 capacity、lease、LRU/idle eviction、reload 與 shutdown。
-- `sglang_service/app.py`：提供 health、model listing、localhost-only management API 和 catch-all proxy；在轉送前把 model identity canonicalize。
+- `vllm_gateway/cli.py`：解析 CLI 與環境變數，載入 catalog，建立 `ModelManager` 和 FastAPI app，再啟動 Uvicorn。
+- `vllm_gateway/catalog.py`：把 TOML 或 legacy INI 解析成 immutable `ModelSpec`，處理 default、alias、名稱正規化與 model path。
+- `vllm_gateway/manager.py`：分配 private port、建立 vLLM subprocess、執行 readiness probe、管理 capacity、lease、LRU/idle eviction、reload 與 shutdown。
+- `vllm_gateway/app.py`：提供 health、model listing、localhost-only management API 和 catch-all proxy；在轉送前把 model identity canonicalize。
 - `models.toml`：repository 目前使用的 model catalog 與部署參數。
 
-`main.py`、`python -m sglang_service`、`vllm-service` 與 `vllm-gateway` 最後都進入 `sglang_service.cli:main`。
+`python -m vllm_gateway`、`vllm-service` 與 `vllm-gateway` 最後都進入 `vllm_gateway.cli:main`。
 
 ## Request flow
 

@@ -81,19 +81,19 @@ aliases = ["qwen3.5-9b"]
 直接執行：
 
 ```bash
-uv run python -m sglang_service
+uv run python -m vllm_gateway
 ```
 
 預載預設模型：
 
 ```bash
-uv run python -m sglang_service --preload
+uv run python -m vllm_gateway --preload
 ```
 
 同時預載多個模型：
 
 ```bash
-uv run python -m sglang_service \
+uv run python -m vllm_gateway \
   --preload-model qwen3.8-27b \
   --preload-model qwen3.5-9b
 ```

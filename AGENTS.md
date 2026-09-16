@@ -18,7 +18,7 @@
 
 目前直接子目錄入口：
 
-- [`sglang_service/AGENTS.md`](sglang_service/AGENTS.md)：gateway package 的 catalog、proxy、backend lifecycle 與 command-generation 規範。
+- [`vllm_gateway/AGENTS.md`](vllm_gateway/AGENTS.md)：gateway package 的 catalog、proxy、backend lifecycle 與 command-generation 規範。
 - [`tests/AGENTS.md`](tests/AGENTS.md)：測試分區、async fake-process 慣例與 companion script 驗證。
 
 未來候選：
@@ -53,7 +53,7 @@ uv run --extra test python -m pytest -q
 CLI 與 package：
 
 ```bash
-uv run python -m sglang_service --help
+uv run python -m vllm_gateway --help
 uv build
 ```
 

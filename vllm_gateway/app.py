@@ -18,7 +18,7 @@ from .manager import (
     PortUnavailable,
 )
 
-LOGGER = logging.getLogger("sglang_service")
+LOGGER = logging.getLogger("vllm_gateway")
 
 # Upstream headers that FastAPI/uvicorn will regenerate — forwarding them
 # produces duplicate headers (two `date`, two `server`, etc.)
