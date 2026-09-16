@@ -4,12 +4,12 @@
 
 本 repository 實作一個 OpenAI-compatible gateway。Gateway 解析 catalog、啟動與停止獨立的 vLLM API server subprocess、轉送 HTTP request，並追蹤每個 backend 的 request lease。模型執行、scheduler、CUDA kernel 與權重格式仍由上游 vLLM 負責。
 
-`~/.local/bin/vllm` 是部署環境中的 companion script，不在此 repository 內。它管理 gateway PID 與 log；gateway 的 `ModelManager` 才擁有 backend process group。測試會讀取該固定路徑，確認 script 不會掃描或終止不屬於 gateway 的程序。
+companion script 在 repo 的 `scripts/vllm`，部署時安裝到 `~/.local/bin/vllm`。它管理 gateway PID 與 log；gateway 的 `ModelManager` 才擁有 backend process group。測試執行 repo 內的 script 版本，確認 script 不會掃描或終止不屬於 gateway 的程序。
 
 ## 元件
 
 - `vllm_gateway/cli.py`：解析 CLI 與環境變數，載入 catalog，建立 `ModelManager` 和 FastAPI app，再啟動 Uvicorn。
-- `vllm_gateway/catalog.py`：把 TOML 或 legacy INI 解析成 immutable `ModelSpec`，處理 default、alias、名稱正規化與 model path。
+- `vllm_gateway/catalog.py`：把 TOML 解析成 immutable `ModelSpec`，處理 default、alias、名稱正規化與 model path。
 - `vllm_gateway/manager.py`：分配 private port、建立 vLLM subprocess、執行 readiness probe、管理 capacity、lease、LRU/idle eviction、reload 與 shutdown。
 - `vllm_gateway/app.py`：提供 health、model listing、localhost-only management API 和 catch-all proxy；在轉送前把 model identity canonicalize。
 - `models.toml`：repository 目前使用的 model catalog 與部署參數。

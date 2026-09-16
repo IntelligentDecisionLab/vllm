@@ -90,7 +90,7 @@ VLLM_MODEL_IDLE_SECONDS
 VLLM_SERVICE_LOG_LEVEL
 ```
 
-部署用 companion script 支援更多 lifecycle 變數，例如 preload、PID/log path 與 stop timeout；該 script 位於 `~/.local/bin/vllm`，不由此 repository 安裝。
+部署用 companion script 支援更多 lifecycle 變數，例如 preload、PID/log path 與 stop timeout；該 script 在 repo 的 `scripts/vllm`，部署時安裝到 `~/.local/bin/vllm`。
 
 ## 檔案放置
 

@@ -26,7 +26,7 @@ uv run python -m vllm_gateway --preload
 
 ## 測試分區
 
-- `tests/test_catalog.py`：TOML/legacy INI parsing、CLI/env precedence、command generation、model defaults，以及部分 compatibility tests。
+- `tests/test_catalog.py`：TOML parsing、CLI/env precedence、command generation、model defaults，以及部分 compatibility tests。
 - `tests/test_app.py`：FastAPI routing、stream lease cleanup、management API 與 hot reload。
 - `tests/test_manager.py`：async lifecycle、concurrent startup、capacity、drain、crash、port ownership 與 reload invariants。
 - `tests/test_script.py`：以 temporary fake service 測試 repository 內 `scripts/vllm` 的 start/status/load/unload/restart/stop 行為和 process ownership 防護。
