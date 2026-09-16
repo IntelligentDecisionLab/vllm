@@ -4,9 +4,8 @@
 
 目前 catalog 包含：
 
-- `qwen3.8-27b`（預設，`Qwen/Qwen3.8-27B-FP8`，GPU 0）
+- `qwen3.8-27b`（預設，`Qwen/Qwen3.8-27B-FP8`，雙 GPU）
 - `qwen3.5-9b`（`Qwen/Qwen3.5-9B`，GPU 1）
-- `qwen3.6-27b`（`Qwen/Qwen3.6-27B-FP8`，GPU 0）
 
 Gateway 會把 alias canonicalize，再將 request 的 `model` 改成 canonical ID 後送往對應 backend。同模型請求共用同一個 vLLM scheduler；不同模型可同時載入並平行服務。
 
@@ -41,25 +40,30 @@ idle_seconds = 1800
 reasoning_parser = "qwen3"
 tool_call_parser = "qwen3_coder"
 attention_backend = "flashinfer"
+async_scheduling = true
+flashinfer_autotune = true
+enable_prefix_caching = true
+speculative_method = "mtp"
+num_speculative_tokens = 2
 
 ["qwen3.8-27b"]
 model_path = "Qwen/Qwen3.8-27B-FP8"
+gpu_memory_utilization = 0.35
+tensor_parallel_size = 2
+max_num_seqs = 64
 idle_seconds = 0.0
 default = true
 aliases = ["qwen3.8-27b-fp8"]
+num_speculative_tokens = 3
 
 ["qwen3.5-9b"]
 model_path = "Qwen/Qwen3.5-9B"
-context_length = 32768
-gpu_memory_utilization = 0.30
+context_length = 131072
+gpu_memory_utilization = 0.35
+device_ids = [1]
 max_num_seqs = 128
-idle_seconds = 300
-aliases = ["qwen3.5-9b"]
-
-["qwen3.6-27b"]
-model_path = "Qwen/Qwen3.6-27B-FP8"
 idle_seconds = 0.0
-aliases = ["qwen3.6-27b-fp8"]
+aliases = ["qwen3.5-9b"]
 ```
 
 `model_path` 可以是 Hugging Face repo ID，或包含 Transformers/Safetensors 權重的本機目錄。Canonical name、normalized name、alias、model path 與 HF source 若跨模型衝突，gateway 會在啟動時明確報錯，不會靜默 routing 到錯誤模型。
@@ -91,7 +95,7 @@ uv run python -m sglang_service --preload
 ```bash
 uv run python -m sglang_service \
   --preload-model qwen3.8-27b \
-  --preload-model qwen3.6-27b
+  --preload-model qwen3.5-9b
 ```
 
 重要選項：
@@ -119,7 +123,7 @@ vllm start
 vllm status
 vllm models
 vllm load qwen3.8-27b
-vllm load qwen3.6-27b
+vllm load qwen3.5-9b
 vllm unload qwen3.8-27b
 vllm restart
 vllm stop
@@ -141,6 +145,7 @@ VLLM_PRELOAD / VLLM_PRELOAD_MODELS（逗號分隔）
 VLLM_MODEL_IDLE_SECONDS
 VLLM_TP_SIZE / VLLM_DP_SIZE
 VLLM_GPU_MEMORY_UTILIZATION
+VLLM_GRACEFUL_SHUTDOWN_TIMEOUT
 VLLM_PID_FILE / VLLM_LOG_FILE
 ```
 
