@@ -9,10 +9,10 @@ import signal
 import socket
 import sys
 import time
+from collections.abc import Iterable
 from dataclasses import dataclass
 from enum import StrEnum
-from pathlib import Path
-from typing import Any, Iterable
+from typing import Any
 
 import httpx
 
@@ -113,7 +113,7 @@ class Backend:
 
 
 class BackendLease:
-    def __init__(self, manager: "ModelManager", backend: Backend):
+    def __init__(self, manager: ModelManager, backend: Backend):
         self._manager = manager
         self.backend = backend
         self._released = False
@@ -123,7 +123,7 @@ class BackendLease:
             self._released = True
             await self._manager.release(self.backend)
 
-    async def __aenter__(self) -> "BackendLease":
+    async def __aenter__(self) -> BackendLease:
         return self
 
     async def __aexit__(self, exc_type: Any, exc_val: Any, exc_tb: Any) -> None:
@@ -221,9 +221,7 @@ class ModelManager:
         self._stopping = False
         self._started = False
         self._idle_task: asyncio.Task[None] | None = None
-        self._client = httpx.AsyncClient(
-            timeout=httpx.Timeout(connect=5.0, read=None, write=10.0, pool=5.0)
-        )
+        self._client = httpx.AsyncClient(timeout=httpx.Timeout(connect=5.0, read=None, write=10.0, pool=5.0))
 
     @classmethod
     def _validate_extra_args(cls, args: Iterable[str], source: str) -> None:
@@ -239,9 +237,7 @@ class ModelManager:
 
     async def start(self, preload: str | Iterable[str] | None = None) -> None:
         self._started = True
-        if self.idle_seconds > 0 or any(
-            spec.idle_seconds and spec.idle_seconds > 0 for spec in self.catalog.specs
-        ):
+        if self.idle_seconds > 0 or any(spec.idle_seconds and spec.idle_seconds > 0 for spec in self.catalog.specs):
             self._idle_task = asyncio.create_task(self._idle_reaper(), name="vllm-idle-reaper")
         if preload:
             names = [preload] if isinstance(preload, str) else list(preload)
@@ -365,9 +361,7 @@ class ModelManager:
             if not backend or backend.state in {BackendState.STOPPED, BackendState.FAILED}:
                 return False
             if backend.active_requests:
-                raise BackendBusyError(
-                    f"model {spec.name!r} has {backend.active_requests} active request(s)"
-                )
+                raise BackendBusyError(f"model {spec.name!r} has {backend.active_requests} active request(s)")
             backend.state = BackendState.DRAINING
             generation = backend.generation
             if backend.start_task and not backend.start_task.done():
@@ -421,11 +415,7 @@ class ModelManager:
                     await self._changed.wait()
                     continue
                 else:
-                    if (
-                        backend
-                        and backend.state is BackendState.FAILED
-                        and backend.active_requests > 0
-                    ):
+                    if backend and backend.state is BackendState.FAILED and backend.active_requests > 0:
                         raise RuntimeError(
                             f"model {spec.name!r} backend failed while "
                             f"{backend.active_requests} request(s) are still releasing"
@@ -440,14 +430,10 @@ class ModelManager:
                             f"model {spec.name!r} is in failure cooldown: {backend.error or 'startup failed'}"
                         )
 
-                    resident = [
-                        item for item in self._backends.values() if item.state in self._RESIDENT_STATES
-                    ]
+                    resident = [item for item in self._backends.values() if item.state in self._RESIDENT_STATES]
                     if len(resident) >= self.max_loaded_models:
                         candidates = [
-                            item
-                            for item in resident
-                            if item.state is BackendState.READY and item.active_requests == 0
+                            item for item in resident if item.state is BackendState.READY and item.active_requests == 0
                         ]
                         if candidates:
                             victim = min(candidates, key=lambda item: item.last_used)
@@ -463,9 +449,7 @@ class ModelManager:
                             await self._changed.wait()
                             continue
                         else:
-                            raise CapacityError(
-                                f"all {self.max_loaded_models} backend slot(s) are active or loading"
-                            )
+                            raise CapacityError(f"all {self.max_loaded_models} backend slot(s) are active or loading")
                     else:
                         port = self._ports.reserve(spec.name)
                         if backend is None:
@@ -505,11 +489,7 @@ class ModelManager:
         async with self._lock:
             backend.active_requests = max(0, backend.active_requests - 1)
             backend.last_used = time.monotonic()
-            if (
-                backend.active_requests == 0
-                and backend.state is BackendState.FAILED
-                and backend.process is None
-            ):
+            if backend.active_requests == 0 and backend.state is BackendState.FAILED and backend.process is None:
                 self._ports.release(backend.spec.name, backend.port)
             self._changed.notify_all()
 
@@ -524,22 +504,14 @@ class ModelManager:
             ready = sorted(
                 backend.spec.name
                 for backend in self._backends.values()
-                if backend.state is BackendState.READY
-                and backend.process
-                and backend.process.returncode is None
+                if backend.state is BackendState.READY and backend.process and backend.process.returncode is None
             )
             active_requests = sum(backend.active_requests for backend in self._backends.values())
-            backend_snapshots = {
-                name: self._backend_dict(backend, name)
-                for name, backend in self._backends.items()
-            }
-            resident_count = sum(
-                backend.state in self._RESIDENT_STATES for backend in self._backends.values()
-            )
+            backend_snapshots = {name: self._backend_dict(backend, name) for name, backend in self._backends.items()}
+            resident_count = sum(backend.state in self._RESIDENT_STATES for backend in self._backends.values())
             stopping = self._stopping
         details = [
-            backend_snapshots.get(spec.name) or self._backend_dict(None, spec.name)
-            for spec in self.catalog.specs
+            backend_snapshots.get(spec.name) or self._backend_dict(None, spec.name) for spec in self.catalog.specs
         ]
         return {
             "status": "ok" if not stopping else "stopping",
@@ -666,9 +638,7 @@ class ModelManager:
 
     async def _start_backend(self, backend: Backend) -> None:
         if not PortAllocator._is_available(backend.port):
-            raise PortUnavailable(
-                f"backend port {backend.port} for model {backend.spec.name!r} became unavailable"
-            )
+            raise PortUnavailable(f"backend port {backend.port} for model {backend.spec.name!r} became unavailable")
 
         model_path = await asyncio.to_thread(resolve_model_path, backend.spec)
         command = self._command(backend.spec, model_path, backend.port)
@@ -724,9 +694,7 @@ class ModelManager:
                     if isinstance(item, dict) and item.get("id") is not None
                 }
                 if backend.spec.name not in served:
-                    last_error = (
-                        f"/v1/models did not advertise expected model {backend.spec.name!r}"
-                    )
+                    last_error = f"/v1/models did not advertise expected model {backend.spec.name!r}"
                     await asyncio.sleep(1.0)
                     continue
                 LOGGER.info("vLLM backend ready: %s on port %d", backend.spec.name, backend.port)
@@ -736,8 +704,7 @@ class ModelManager:
             await asyncio.sleep(1.0)
 
         raise TimeoutError(
-            f"timed out after {self.startup_timeout:.0f}s waiting for vLLM backend "
-            f"{backend.spec.name!r} ({last_error})"
+            f"timed out after {self.startup_timeout:.0f}s waiting for vLLM backend {backend.spec.name!r} ({last_error})"
         )
 
     def _command(self, spec: ModelSpec, model_path: str, port: int) -> list[str]:
@@ -758,11 +725,7 @@ class ModelManager:
         batched_tokens = (
             self.max_num_batched_tokens
             if self.max_num_batched_tokens is not None
-            else (
-                spec.max_num_batched_tokens
-                if spec.max_num_batched_tokens is not None
-                else 4096
-            )
+            else (spec.max_num_batched_tokens if spec.max_num_batched_tokens is not None else 4096)
         )
 
         command = [
@@ -853,7 +816,7 @@ class ModelManager:
                     break
                 try:
                     await asyncio.wait_for(self._changed.wait(), timeout=remaining)
-                except asyncio.TimeoutError:
+                except TimeoutError:
                     break
 
         await self._stop_backend(backend)
@@ -864,9 +827,7 @@ class ModelManager:
                 backend.start_task = None
                 if backend.active_requests > 0:
                     backend.state = BackendState.FAILED
-                    backend.error = (
-                        f"backend stopped while {backend.active_requests} request(s) were still active"
-                    )
+                    backend.error = f"backend stopped while {backend.active_requests} request(s) were still active"
                     backend.failed_at = time.monotonic()
                 else:
                     backend.state = BackendState.STOPPED
@@ -884,7 +845,7 @@ class ModelManager:
             return
         try:
             await asyncio.wait_for(process.wait(), timeout=self.shutdown_timeout)
-        except asyncio.TimeoutError:
+        except TimeoutError:
             try:
                 os.killpg(process.pid, signal.SIGKILL)
             except ProcessLookupError:
@@ -898,11 +859,7 @@ class ModelManager:
 
     async def _idle_reaper(self) -> None:
         while True:
-            thresholds = [
-                threshold
-                for spec in self.catalog.specs
-                if (threshold := self._idle_threshold(spec)) > 0
-            ]
+            thresholds = [threshold for spec in self.catalog.specs if (threshold := self._idle_threshold(spec)) > 0]
             minimum = min(thresholds) if thresholds else 60.0
             await asyncio.sleep(min(max(minimum / 2.0, 1.0), 60.0))
 

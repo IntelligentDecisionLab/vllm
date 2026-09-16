@@ -2,9 +2,10 @@ from __future__ import annotations
 
 import os
 import tomllib
+from collections.abc import Iterable
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Iterable
+from typing import Any
 
 
 def _truthy(value: Any) -> bool:
@@ -36,6 +37,8 @@ def _float_or_none(value: Any) -> float | None:
     if isinstance(value, str):
         s = value.strip()
         return float(s) if s else None
+
+
 def _first(mapping: dict[str, Any], *keys: str) -> Any:
     for k in keys:
         if k in mapping and mapping[k] is not None:
@@ -224,7 +227,7 @@ class ModelCatalog:
         return value.strip().lower().replace("_", "-").replace(".", "-")
 
     @classmethod
-    def from_toml_file(cls, config_file: str | os.PathLike[str]) -> "ModelCatalog":
+    def from_toml_file(cls, config_file: str | os.PathLike[str]) -> ModelCatalog:
         path = Path(config_file).expanduser().resolve()
         if not path.is_file():
             raise FileNotFoundError(f"configuration file does not exist: {path}")
@@ -397,7 +400,7 @@ class ModelCatalog:
         return cls(specs, path)
 
     @classmethod
-    def from_preset_file(cls, preset_file: str | os.PathLike[str]) -> "ModelCatalog":
+    def from_preset_file(cls, preset_file: str | os.PathLike[str]) -> ModelCatalog:
         path = Path(preset_file).expanduser().resolve()
         if path.suffix == ".toml":
             return cls.from_toml_file(path)
@@ -469,7 +472,7 @@ class ModelCatalog:
         return cls(specs, path)
 
     @classmethod
-    def from_file(cls, config_file: str | os.PathLike[str]) -> "ModelCatalog":
+    def from_file(cls, config_file: str | os.PathLike[str]) -> ModelCatalog:
         path = Path(config_file).expanduser().resolve()
         if path.suffix == ".ini":
             return cls.from_preset_file(path)
@@ -530,9 +533,7 @@ def resolve_model_path(spec: ModelSpec) -> str:
         try:
             from huggingface_hub import hf_hub_download
         except ImportError as exc:
-            raise RuntimeError(
-                "huggingface-hub is required to resolve HF model files; run `uv sync`"
-            ) from exc
+            raise RuntimeError("huggingface-hub is required to resolve HF model files; run `uv sync`") from exc
         repo = spec.hf_repo or target
         return hf_hub_download(repo_id=repo, filename=spec.hf_file)
 

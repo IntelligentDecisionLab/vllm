@@ -19,6 +19,14 @@ runtime = [
     "vllm==0.27.1",
 ]
 test = ["pytest>=8.0"]
+dev = ["ruff>=0.14"]
+
+[tool.ruff]
+line-length = 120
+target-version = "py312"
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "UP", "B"]
 
 [project.scripts]
 vllm-service = "sglang_service.cli:main"

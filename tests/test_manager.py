@@ -441,10 +441,7 @@ async def test_reload_restarts_updated_model_with_new_spec(monkeypatch: pytest.M
 
 async def test_reload_recomputes_default_max_loaded_models_only() -> None:
     four_models = ModelCatalog(
-        [
-            ModelSpec(name=f"model-{index}", model_path=f"org/model-{index}")
-            for index in range(4)
-        ],
+        [ModelSpec(name=f"model-{index}", model_path=f"org/model-{index}") for index in range(4)],
         Path("models.toml"),
     )
     one_model = ModelCatalog(
@@ -464,10 +461,18 @@ async def test_reload_recomputes_default_max_loaded_models_only() -> None:
     await pinned.shutdown()
 
 
-@pytest.mark.parametrize("flag", [
-    "device-ids", "async-scheduling", "enable-flashinfer-autotune", "speculative-config",
-    "enable-chunked-prefill", "enable-prefix-caching", "enable-auto-tool-choice",
-])
+@pytest.mark.parametrize(
+    "flag",
+    [
+        "device-ids",
+        "async-scheduling",
+        "enable-flashinfer-autotune",
+        "speculative-config",
+        "enable-chunked-prefill",
+        "enable-prefix-caching",
+        "enable-auto-tool-choice",
+    ],
+)
 @pytest.mark.parametrize("spelling", ["hyphen", "underscore", "negated", "negated_underscore"])
 def test_new_managed_flags_reject_all_spellings(flag: str, spelling: str) -> None:
     if spelling.startswith("negated"):

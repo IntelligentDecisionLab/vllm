@@ -195,7 +195,9 @@ def main(argv: list[str] | None = None) -> None:
         format="%(asctime)s %(levelname)s %(name)s: %(message)s",
     )
     catalog = ModelCatalog.from_file(args.config_file)
-    raw_default = args.default_model.strip() if isinstance(args.default_model, str) and args.default_model.strip() else None
+    raw_default = (
+        args.default_model.strip() if isinstance(args.default_model, str) and args.default_model.strip() else None
+    )
     default_model = raw_default or catalog.default.name
     catalog.get(default_model)  # validate before binding the public port
     manager = ModelManager(

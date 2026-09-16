@@ -8,7 +8,6 @@ import textwrap
 import time
 from pathlib import Path
 
-
 SCRIPT = Path.home() / ".local" / "bin" / "vllm"
 
 

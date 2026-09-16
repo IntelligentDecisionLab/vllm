@@ -2,19 +2,17 @@ from __future__ import annotations
 
 import json
 import logging
+from collections.abc import AsyncIterator, Iterable
 from contextlib import asynccontextmanager
-from collections.abc import Iterable
 from pathlib import Path
-from typing import AsyncIterator
 
 import httpx
-from fastapi import FastAPI, HTTPException, Request
+from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse, Response, StreamingResponse
 
 from .catalog import ModelCatalog, ModelSpec
 from .manager import (
     BackendBusyError,
-    BackendLease,
     CapacityError,
     ModelManager,
     PortUnavailable,
@@ -111,9 +109,7 @@ def create_app(
         status = await manager.health()
         try:
             spec = app.state.catalog.get(model_id)
-            return JSONResponse(
-                content=spec.public_dict(loaded=(spec.name in status["loaded_models"]))
-            )
+            return JSONResponse(content=spec.public_dict(loaded=(spec.name in status["loaded_models"])))
         except KeyError as exc:
             return JSONResponse(
                 status_code=404,
@@ -163,7 +159,12 @@ def create_app(
         if config_path is None:
             return JSONResponse(
                 status_code=400,
-                content={"error": {"message": "no config file was configured for this service", "type": "invalid_request_error"}},
+                content={
+                    "error": {
+                        "message": "no config file was configured for this service",
+                        "type": "invalid_request_error",
+                    }
+                },
             )
         try:
             new_catalog = ModelCatalog.from_file(config_path)
@@ -259,11 +260,7 @@ def create_app(
             )
 
         backend = lease.backend
-        headers = {
-            key: value
-            for key, value in request.headers.items()
-            if key.lower() not in HOP_BY_HOP_HEADERS
-        }
+        headers = {key: value for key, value in request.headers.items() if key.lower() not in HOP_BY_HOP_HEADERS}
         if outgoing_body:
             headers["content-length"] = str(len(outgoing_body))
         else:

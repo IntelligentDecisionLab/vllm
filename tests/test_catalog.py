@@ -1,5 +1,4 @@
 import json
-import os
 import tempfile
 from pathlib import Path
 
@@ -188,12 +187,18 @@ def test_cli_defaults() -> None:
 
 
 def test_cli_custom_arguments() -> None:
-    args = build_parser().parse_args([
-        "--config", "/tmp/custom_models.toml",
-        "--port", "8000",
-        "--tp-size", "4",
-        "--default-model", "qwen3.6-27b",
-    ])
+    args = build_parser().parse_args(
+        [
+            "--config",
+            "/tmp/custom_models.toml",
+            "--port",
+            "8000",
+            "--tp-size",
+            "4",
+            "--default-model",
+            "qwen3.6-27b",
+        ]
+    )
 
     assert args.config_file == Path("/tmp/custom_models.toml")
     assert args.port == 8000
@@ -544,11 +549,11 @@ async def test_backend_lease_async_context_manager() -> None:
     backend = Backend(spec=spec, port=30000, active_requests=1)
     lease = BackendLease(manager, backend)
 
-    async with lease as l:
-        assert l is lease
-        assert l.backend.active_requests == 1
+    async with lease as acquired_lease:
+        assert acquired_lease is lease
+        assert acquired_lease.backend.active_requests == 1
 
-    assert l._released is True
+    assert acquired_lease._released is True
     assert backend.active_requests == 0
 
 
@@ -622,6 +627,7 @@ async def test_app_proxy_lease_cleanup_on_http_error(monkeypatch: pytest.MonkeyP
     app = create_app(catalog, manager)
 
     from sglang_service.manager import Backend
+
     mock_backend = Backend(spec=catalog.default, port=30000, active_requests=0)
 
     async def mock_acquire(name: str) -> BackendLease:
@@ -633,6 +639,7 @@ async def test_app_proxy_lease_cleanup_on_http_error(monkeypatch: pytest.MonkeyP
 
     async def mock_send_error(*args, **kwargs):
         import httpx
+
         raise httpx.ConnectError("connection refused")
 
     monkeypatch.setattr(manager, "acquire", mock_acquire)
@@ -652,6 +659,7 @@ async def test_app_proxy_lease_cleanup_on_unhandled_exception(monkeypatch: pytes
     app = create_app(catalog, manager)
 
     from sglang_service.manager import Backend
+
     mock_backend = Backend(spec=catalog.default, port=30000, active_requests=0)
 
     async def mock_acquire(name: str) -> BackendLease:
@@ -796,6 +804,7 @@ def test_sglang_download_single_table_and_aliases() -> None:
         path = Path(f.name)
 
     import subprocess
+
     cmd = [
         "python3",
         "-c",
@@ -812,12 +821,26 @@ if isinstance(data.get("models"), dict):
     if has_subdicts:
         for name, val in models_map.items():
             if isinstance(val, dict):
-                repo = val.get("model_path") or val.get("model") or val.get("path") or val.get("hf_repo") or val.get("hf-repo") or val.get("repo_id")
+                repo = (
+                    val.get("model_path")
+                    or val.get("model")
+                    or val.get("path")
+                    or val.get("hf_repo")
+                    or val.get("hf-repo")
+                    or val.get("repo_id")
+                )
                 file_ = val.get("hf_file") or val.get("hf-file")
                 models.append((name, repo, file_))
     elif any(k in models_map for k in ("model_path", "model", "path", "hf_repo", "hf-repo", "repo_id")):
         m_name = str(models_map.get("name") or "default")
-        repo = models_map.get("model_path") or models_map.get("model") or models_map.get("path") or models_map.get("hf_repo") or models_map.get("hf-repo") or models_map.get("repo_id")
+        repo = (
+            models_map.get("model_path")
+            or models_map.get("model")
+            or models_map.get("path")
+            or models_map.get("hf_repo")
+            or models_map.get("hf-repo")
+            or models_map.get("repo_id")
+        )
         file_ = models_map.get("hf_file") or models_map.get("hf-file")
         models.append((m_name, repo, file_))
 assert len(models) == 1
@@ -852,7 +875,8 @@ def test_migrated_catalog_runtime_fields(name: str, tokens: int, devices: tuple[
     assert "--enable-prefix-caching" in command
     assert "--enable-chunked-prefill" not in command
     assert json.loads(command[command.index("--speculative-config") + 1]) == {
-        "method": "mtp", "num_speculative_tokens": tokens,
+        "method": "mtp",
+        "num_speculative_tokens": tokens,
     }
     if devices is None:
         assert "--device-ids" not in command
@@ -862,7 +886,7 @@ def test_migrated_catalog_runtime_fields(name: str, tokens: int, devices: tuple[
 
 def test_typed_runtime_defaults_and_overrides(tmp_path: Path) -> None:
     path = tmp_path / "models.toml"
-    path.write_text('''
+    path.write_text("""
 [default]
 device_ids = [0, 1]
 async_scheduling = true
@@ -880,7 +904,7 @@ flashinfer_autotune = false
 enable_prefix_caching = false
 speculative_method = "ngram"
 num_speculative_tokens = 3
-''')
+""")
     catalog = ModelCatalog.from_toml_file(path)
     manager = ModelManager(catalog)
     inherited = catalog.get("inherited")
@@ -905,7 +929,8 @@ num_speculative_tokens = 3
         assert f"--no-{flag}" in command
         assert f"--{flag}" not in command
     assert json.loads(command[command.index("--speculative-config") + 1]) == {
-        "method": "ngram", "num_speculative_tokens": 3,
+        "method": "ngram",
+        "num_speculative_tokens": 3,
     }
 
 
@@ -932,15 +957,23 @@ def test_unset_runtime_fields_and_optional_speculative_tokens(tmp_path: Path, me
     assert command[command.index("--gpu-memory-utilization") + 1] == "0.9"
 
 
-@pytest.mark.parametrize("defaults,model_values,expected", [
-    ("", "mem_fraction_static = 0.35", 0.35),
-    ("mem_fraction_static = 0.45", "", 0.45),
-    ("gpu_memory_utilization = 0.45", "mem_fraction_static = 0.35", 0.35),
-    ("mem_fraction_static = 0.45", "gpu_memory_utilization = 0.35", 0.35),
-    ("", "mem_fraction_static = 0.45\ngpu_memory_utilization = 0.35", 0.35),
-    ("mem_fraction_static = 0.45\ngpu_memory_utilization = 0.35", "", 0.35),
-])
-def test_gpu_memory_deprecated_alias_precedence(tmp_path: Path, defaults: str, model_values: str, expected: float) -> None:
+@pytest.mark.parametrize(
+    "defaults,model_values,expected",
+    [
+        ("", "mem_fraction_static = 0.35", 0.35),
+        ("mem_fraction_static = 0.45", "", 0.45),
+        ("gpu_memory_utilization = 0.45", "mem_fraction_static = 0.35", 0.35),
+        ("mem_fraction_static = 0.45", "gpu_memory_utilization = 0.35", 0.35),
+        ("", "mem_fraction_static = 0.45\ngpu_memory_utilization = 0.35", 0.35),
+        ("mem_fraction_static = 0.45\ngpu_memory_utilization = 0.35", "", 0.35),
+    ],
+)
+def test_gpu_memory_deprecated_alias_precedence(
+    tmp_path: Path,
+    defaults: str,
+    model_values: str,
+    expected: float,
+) -> None:
     path = tmp_path / "models.toml"
     path.write_text(f'[default]\n{defaults}\n[model]\nmodel_path = "org/model"\n{model_values}\n')
     catalog = ModelCatalog.from_toml_file(path)
@@ -954,19 +987,31 @@ def test_gpu_memory_deprecated_alias_precedence(tmp_path: Path, defaults: str, m
     assert "mem_fraction_static" not in spec.public_dict()["metadata"]
 
 
-@pytest.mark.parametrize("key,value", [
-    ("device_ids", '"0,1"'), ("device_ids", "[true]"), ("device_ids", "[0.5]"),
-    ("async_scheduling", '"false"'), ("async_scheduling", "1"),
-    ("flashinfer_autotune", '"true"'), ("flashinfer_autotune", "0"),
-    ("enable_prefix_caching", '"true"'), ("enable_prefix_caching", "1"),
-    ("speculative_method", "true"), ("speculative_method", "2"),
-    ("num_speculative_tokens", "true"), ("num_speculative_tokens", "2.5"),
-    ("num_speculative_tokens", '"2"'),
-])
+@pytest.mark.parametrize(
+    "key,value",
+    [
+        ("device_ids", '"0,1"'),
+        ("device_ids", "[true]"),
+        ("device_ids", "[0.5]"),
+        ("async_scheduling", '"false"'),
+        ("async_scheduling", "1"),
+        ("flashinfer_autotune", '"true"'),
+        ("flashinfer_autotune", "0"),
+        ("enable_prefix_caching", '"true"'),
+        ("enable_prefix_caching", "1"),
+        ("speculative_method", "true"),
+        ("speculative_method", "2"),
+        ("num_speculative_tokens", "true"),
+        ("num_speculative_tokens", "2.5"),
+        ("num_speculative_tokens", '"2"'),
+    ],
+)
 @pytest.mark.parametrize("section", ["default", "model"])
 def test_runtime_fields_reject_invalid_toml_types(tmp_path: Path, key: str, value: str, section: str) -> None:
     path = tmp_path / "models.toml"
     entry = f"{key} = {value}\n"
-    path.write_text(f'[default]\n{entry if section == "default" else ""}[model]\nmodel_path = "org/model"\n{entry if section == "model" else ""}')
+    default_entry = entry if section == "default" else ""
+    model_entry = entry if section == "model" else ""
+    path.write_text(f'[default]\n{default_entry}[model]\nmodel_path = "org/model"\n{model_entry}')
     with pytest.raises(ValueError, match=key):
         ModelCatalog.from_toml_file(path)
