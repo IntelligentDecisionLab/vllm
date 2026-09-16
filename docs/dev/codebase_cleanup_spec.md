@@ -169,7 +169,7 @@ TOML 結構方言（root named tables、`[models.<name>]` map、`[[models]]` arr
 - `uv run --extra test python -m pytest -q` 綠。
 - `uv run --extra dev ruff check .` 綠。
 - `bash -n ~/.local/bin/vllm` 通過；`vllm status` 對 running service 仍回報正常。
-- `rg -n "SGLANG_|from_preset_file|_parse_preset_file|mem_fraction_static|is_gguf|embeddings|spec_type|reasoning_budget|hf_file" sglang_service tests` 零命中。
+- `rg -n "SGLANG_|from_preset_file|_parse_preset_file|mem_fraction_static|is_gguf|spec_type|reasoning_budget|hf_file" sglang_service tests` 零命中；`rg -n "embeddings" sglang_service tests` 唯一允許的命中是 `manager.py` 的 HF override key `original_max_position_embeddings`（Hugging Face 設定檔的正式欄位名，不是 gateway 欄位）。
 
 ## 8. Slice 3：package 改名 `sglang_service` → `vllm_gateway`
 

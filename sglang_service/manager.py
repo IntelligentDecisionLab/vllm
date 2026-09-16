@@ -787,7 +787,7 @@ class ModelManager:
             if spec.rope_scale is not None:
                 rope_dict["factor"] = spec.rope_scale
             if spec.yarn_orig_ctx is not None:
-                rope_dict["original_max_position_" + "emb" + "eddings"] = spec.yarn_orig_ctx
+                rope_dict["original_max_position_embeddings"] = spec.yarn_orig_ctx
             override_args["rope_scaling"] = rope_dict
         if spec.rope_theta is not None:
             override_args["rope_theta"] = spec.rope_theta
