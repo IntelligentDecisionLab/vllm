@@ -28,9 +28,9 @@ def test_companion_script_lifecycle_and_management(tmp_path: Path) -> None:
         encoding="utf-8",
     )
 
-    fake_server_dir = tmp_path / "vllm-gateway"
-    fake_server_dir.mkdir()
-    fake_server = fake_server_dir / "gateway_fake.py"
+    # The filename contains "vllm-gateway" so the companion script's
+    # pid_matches_gateway recognizes this fake process.
+    fake_server = tmp_path / "vllm-gateway-fake.py"
     fake_server.write_text(
         textwrap.dedent(
             """
