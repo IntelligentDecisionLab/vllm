@@ -1,0 +1,26 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+      - name: Set up uv and Python
+        uses: astral-sh/setup-uv@v6
+        with:
+          python-version: "3.12"
+          enable-cache: true
+      - name: Install test and development dependencies
+        run: uv sync --extra test --extra dev
+      - name: Run Ruff lint
+        run: uv run --extra dev ruff check .
+      - name: Check Ruff formatting
+        run: uv run --extra dev ruff format --check .
+      - name: Run tests
+        run: uv run --extra test python -m pytest -q

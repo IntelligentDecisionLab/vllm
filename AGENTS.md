@@ -57,4 +57,4 @@ uv run python -m sglang_service --help
 uv build
 ```
 
-Repository 沒有配置 lint/type-check gate。只有 runtime、catalog 或 backend command 變更需要另做 GPU smoke test；命令與驗收項目見 [`docs/development.md`](docs/development.md#gpu-smoke-test)。
+Repository 已配置 Ruff lint、format 與 pytest gate；type-check gate 仍未配置。只有 runtime、catalog 或 backend command 變更需要另做 GPU smoke test；命令與驗收項目見 [`docs/development.md`](docs/development.md#gpu-smoke-test)。

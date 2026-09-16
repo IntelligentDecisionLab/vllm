@@ -51,7 +51,28 @@ Package build：
 uv build
 ```
 
-Repository 目前沒有 CI workflow，也沒有 Ruff、Black、mypy 或其他 lint/type-check 設定。不要在文件中宣稱存在未配置的 lint gate。
+## CI 與 Ruff gate
+
+GitHub Actions 在推送到 `main` 或建立、更新 pull request 時執行，使用 Python 3.12 的 CPU-only runner。CI 會安裝 `test` 與 `dev` extras，依序執行 Ruff lint、Ruff format 檢查和完整 pytest suite；不會安裝需要 GPU/CUDA 的 `runtime` extra。
+
+本機可用以下命令執行相同檢查：
+
+```bash
+uv sync --extra test --extra dev
+uv run --extra dev ruff check .
+uv run --extra dev ruff format --check .
+uv run --extra test python -m pytest -q
+```
+
+安裝 pre-commit 後，提交前會自動執行 Ruff 修正與格式化：
+
+```bash
+uv tool install pre-commit
+pre-commit install
+pre-commit run --all-files
+```
+
+Repository 尚未配置 type-check gate。
 
 ## 修改工作流
 
