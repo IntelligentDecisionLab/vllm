@@ -2,7 +2,7 @@
 
 ## 設定來源與優先級
 
-Gateway 預設讀取 repository root 的 `models.toml`。`--config` 可指定其他 TOML；`.ini` 路徑只保留 legacy preset 相容性。
+Gateway 預設讀取 repository root 的 `models.toml`。`--config` 可指定其他 TOML。
 
 單一 backend command 的設定優先級為：
 
@@ -21,7 +21,7 @@ Gateway 預設讀取 repository root 的 `models.toml`。`--config` 可指定其
 
 | 類別             | 欄位                                                                                                          |
 | ---------------- | ------------------------------------------------------------------------------------------------------------- |
-| Identity         | `model_path`, `hf_repo`, `hf_file`, `aliases`, `default`                                                      |
+| Identity         | `model_path`, `hf_repo`, `aliases`, `default`                                                               |
 | Capacity         | `tensor_parallel_size`, `data_parallel_size`, `gpu_memory_utilization`, `max_num_seqs`, `max_num_batched_tokens` |
 | Context/KV       | `context_length`, `kv_cache_dtype`, `rope_scaling`, `rope_scale`, `yarn_orig_ctx`, `rope_theta`               |
 | Request behavior | `reasoning`, `reasoning_parser`, `tool_call_parser`, `chat_template`                                          |
@@ -29,11 +29,9 @@ Gateway 預設讀取 repository root 的 `models.toml`。`--config` 可指定其
 | Runtime          | `attention_backend`, `device_ids`, `async_scheduling`, `flashinfer_autotune`, `enable_prefix_caching`, `vllm_args`                                                                              |
 | Speculative decoding | `speculative_method`, `num_speculative_tokens` |
 
-`gpu_memory_utilization` 取代舊欄位 `mem_fraction_static`；parser 仍接受舊名作 deprecated alias。同一層同時寫兩者時，新名優先；per-model 的舊名仍會覆寫 `[default]` 的新名。
-
 `device_ids` 使用 TOML 整數陣列（例如 `[0, 1]`）；`async_scheduling`、`flashinfer_autotune`、`enable_prefix_caching` 使用 boolean。未設定時不輸出 flag，`false` 會輸出對應 `--no-` flag，以覆寫 default 的 `true`。`speculative_method` 使用字串，`num_speculative_tokens` 使用整數；只有設定 method 時才產生 `--speculative-config`，tokens 可省略。這些新欄位支援 `[default]` 與 per-model，沒有新增 CLI/env override。
 
-`model_path` 可指向本機 Transformers/Safetensors 目錄或 Hugging Face repo ID。若它看起來是明確的本機路徑但不存在，gateway 會報錯。指定 `hf_repo` 和 `hf_file` 時，catalog 才會用 `huggingface_hub.hf_hub_download()` 解析單一檔案。
+`model_path` 可指向本機 Transformers/Safetensors 目錄或 Hugging Face repo ID。若它看起來是明確的本機路徑但不存在，gateway 會報錯。
 
 Canonical name、normalized name、alias、model path、source 與 Hugging Face repo 必須在整份 catalog 中唯一。名稱衝突會使 gateway 在 bind public port 前停止。
 
@@ -92,7 +90,7 @@ VLLM_MODEL_IDLE_SECONDS
 VLLM_SERVICE_LOG_LEVEL
 ```
 
-`cli.py` 還接受部分舊 `SGLANG_*` config path 名稱作低優先級 fallback。部署用 companion script 支援更多 lifecycle 變數，例如 preload、PID/log path 與 stop timeout；該 script 位於 `~/.local/bin/vllm`，不由此 repository 安裝。
+部署用 companion script 支援更多 lifecycle 變數，例如 preload、PID/log path 與 stop timeout；該 script 位於 `~/.local/bin/vllm`，不由此 repository 安裝。
 
 ## 檔案放置
 

@@ -40,7 +40,7 @@ PROXY_METHODS = ["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"]
 
 
 def _apply_model_defaults(payload: dict[str, object], spec: ModelSpec) -> None:
-    """Translate llama.cpp preset defaults into vLLM request options."""
+    """Translate catalog request defaults into vLLM request options."""
 
     if spec.reasoning != "off" or not isinstance(payload.get("messages"), list):
         return

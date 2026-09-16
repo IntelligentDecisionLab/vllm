@@ -13,17 +13,7 @@ from .manager import ModelManager
 
 
 def _default_config_file() -> Path:
-    env_path = (
-        os.getenv("VLLM_CONFIG_FILE")
-        or os.getenv("VLLM_MODELS_FILE")
-        or os.getenv("VLLM_MODELS_CONFIG")
-        or os.getenv("VLLM_CONFIG")
-        or os.getenv("VLLM_PRESET_FILE")
-        or os.getenv("VLLM_PRESETS_FILE")
-        or os.getenv("SGLANG_CONFIG_FILE")
-        or os.getenv("SGLANG_MODELS_FILE")
-        or os.getenv("SGLANG_PRESETS_FILE")
-    )
+    env_path = os.getenv("VLLM_CONFIG_FILE")
     if env_path and env_path.strip():
         return Path(env_path.strip())
     project_root = Path(__file__).resolve().parents[1]
@@ -50,40 +40,12 @@ def _env_float(key: str, default: float | None = None) -> float | None:
     return default
 
 
-class SglangNamespace(argparse.Namespace):
-    @property
-    def config(self) -> Path:
-        return getattr(self, "config_file", None)
-
-    @property
-    def models_config(self) -> Path:
-        return getattr(self, "config_file", None)
-
-    @property
-    def models_file(self) -> Path:
-        return getattr(self, "config_file", None)
-
-    @property
-    def preset_file(self) -> Path:
-        return getattr(self, "config_file", None)
-
-
-class SglangArgumentParser(argparse.ArgumentParser):
-    def parse_args(self, args=None, namespace=None):
-        if namespace is None:
-            namespace = SglangNamespace()
-        return super().parse_args(args=args, namespace=namespace)
-
-
 def build_parser() -> argparse.ArgumentParser:
-    parser = SglangArgumentParser(description="Serve native FP8 models through vLLM on an OpenAI API.")
+    parser = argparse.ArgumentParser(description="Serve native FP8 models through vLLM on an OpenAI API.")
     parser.add_argument("--host", default=os.getenv("VLLM_SERVICE_HOST", "0.0.0.0"))
     parser.add_argument("--port", type=int, default=_env_int("VLLM_SERVICE_PORT", 11432))
     parser.add_argument(
         "--config",
-        "--config-file",
-        "--models-config",
-        "--preset-file",
         dest="config_file",
         type=Path,
         default=_default_config_file(),

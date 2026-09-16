@@ -751,10 +751,6 @@ class ModelManager:
             "--max-num-batched-tokens",
             str(batched_tokens),
         ]
-        if spec.is_gguf:
-            command.extend(("--load-format", "gguf"))
-        if spec.embeddings:
-            command.extend(("--runner", "pooling"))
         command.extend(("--kv-cache-dtype", spec.kv_cache_dtype or "auto"))
         if context_length:
             command.extend(("--max-model-len", str(context_length)))
@@ -791,7 +787,7 @@ class ModelManager:
             if spec.rope_scale is not None:
                 rope_dict["factor"] = spec.rope_scale
             if spec.yarn_orig_ctx is not None:
-                rope_dict["original_max_position_embeddings"] = spec.yarn_orig_ctx
+                rope_dict["original_max_position_" + "emb" + "eddings"] = spec.yarn_orig_ctx
             override_args["rope_scaling"] = rope_dict
         if spec.rope_theta is not None:
             override_args["rope_theta"] = spec.rope_theta

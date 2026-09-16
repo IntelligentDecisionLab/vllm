@@ -13,6 +13,7 @@
 ## Local Conventions
 
 - `ModelSpec` 維持 frozen/slots dataclass。新增 catalog 欄位時，同步 parser、manager precedence、public metadata（若屬 API contract）和 tests。
+- Catalog parser 只接受 `docs/configuration.md` 列出的底線正規 key。
 - Gateway-managed vLLM flags 必須留在 `_PROTECTED_VLLM_FLAGS`。曾因 `--attention-backend` 同時出現在 `vllm_args` 和 manager contract，導致真實 model load 被 validation 拒絕；正式欄位是 `ModelSpec.attention_backend`。
 - `ModelManager._lock` 保護 backend map、state、active request count 與 port ownership。不要在持有 lock 時等待 subprocess、HTTP 或長時間工作；使用 task 和 condition 協調。
 - 每個成功取得的 `BackendLease` 必須在普通 response、SSE、HTTP error、cancellation 與 exception 路徑釋放一次。

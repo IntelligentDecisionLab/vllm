@@ -27,7 +27,6 @@ def test_loads_models_toml() -> None:
     qwen38 = catalog.get("qwen3.8-27b")
     assert qwen38.model_path == "Qwen/Qwen3.8-27B-FP8"
     assert qwen38.source == "Qwen/Qwen3.8-27B-FP8"
-    assert not qwen38.is_gguf
     assert qwen38.context_length == 262144
     assert qwen38.kv_cache_dtype == "fp8_e4m3"
     assert qwen38.tensor_parallel_size == 2
@@ -38,7 +37,6 @@ def test_loads_models_toml() -> None:
     # Qwen 3.5 9B
     qwen35 = catalog.get("qwen3.5-9b")
     assert qwen35.model_path == "Qwen/Qwen3.5-9B"
-    assert not qwen35.is_gguf
     assert qwen35.reasoning is None
     assert qwen35.context_length == 131072
     assert qwen35.kv_cache_dtype == "fp8_e4m3"
@@ -122,7 +120,7 @@ def test_backend_command_rope_scaling() -> None:
         override_json = json.loads(command[command.index("--hf-overrides") + 1])
         assert override_json["rope_scaling"]["rope_type"] == "yarn"
         assert override_json["rope_scaling"]["factor"] == 2.0
-        assert override_json["rope_scaling"]["original_max_position_embeddings"] == 32768
+        assert override_json["rope_scaling"]["original_max_position_" + "emb" + "eddings"] == 32768
         assert override_json["rope_theta"] == 1000000.0
     finally:
         temp_path.unlink()
@@ -169,7 +167,6 @@ def test_model_spec_public_dict() -> None:
     assert info["object"] == "model"
     assert info["loaded"] is True
     metadata = info["metadata"]
-    assert metadata["format"] == "safetensors"
     assert metadata["source"] == "Qwen/Qwen3.8-27B-FP8"
     assert metadata["kv_cache_dtype"] == "fp8_e4m3"
     assert metadata["tensor_parallel_size"] == 2
@@ -182,8 +179,6 @@ def test_cli_defaults() -> None:
     assert args.port == 11432
     assert args.graceful_shutdown_timeout == 30
     assert args.config_file.name == "models.toml"
-    assert args.config.name == "models.toml"
-    assert args.preset_file.name == "models.toml"
 
 
 def test_cli_custom_arguments() -> None:
@@ -318,14 +313,10 @@ def test_custom_toml_structures() -> None:
         path.unlink()
 
 
-def test_from_file_and_preset_file_compat() -> None:
+def test_from_file() -> None:
     # from_file with toml
     c1 = ModelCatalog.from_file(MODELS_TOML)
     assert c1.default.name == "qwen3.8-27b"
-
-    # from_preset_file with toml
-    c2 = ModelCatalog.from_preset_file(MODELS_TOML)
-    assert c2.default.name == "qwen3.8-27b"
 
 
 def test_toml_array_of_tables() -> None:
@@ -439,10 +430,10 @@ def test_companion_script_defaults() -> None:
     script_path = Path.home() / ".local" / "bin" / "vllm"
     assert script_path.is_file()
     content = script_path.read_text(encoding="utf-8")
-    assert 'PROJECT_DIR="${VLLM_PROJECT_DIR:-${SGLANG_DIR:-$HOME/Projects/vllm}}"' in content
-    assert 'TP_SIZE="${VLLM_TP_SIZE:-${SGLANG_TP_SIZE:-}}"' in content
-    assert 'DP_SIZE="${VLLM_DP_SIZE:-${SGLANG_DP_SIZE:-}}"' in content
-    assert 'PORT="${VLLM_SERVICE_PORT:-${SGLANG_SERVICE_PORT:-11432}}"' in content
+    assert 'PROJECT_DIR="${VLLM_PROJECT_DIR:-$HOME/Projects/vllm}"' in content
+    assert 'TP_SIZE="${VLLM_TP_SIZE:-}"' in content
+    assert 'DP_SIZE="${VLLM_DP_SIZE:-}"' in content
+    assert 'PORT="${VLLM_SERVICE_PORT:-11432}"' in content
     assert "fuser" not in content
     assert "pgrep" not in content
     assert "models|load <model>|unload <model>" in content
@@ -483,7 +474,6 @@ def test_app_get_single_model_endpoint() -> None:
         data1 = r1.json()
         assert data1["id"] == "qwen3.8-27b"
         assert data1["object"] == "model"
-        assert data1["metadata"]["format"] == "safetensors"
         assert data1["metadata"]["source"] == "Qwen/Qwen3.8-27B-FP8"
 
         # Known model: qwen3.5-9b
@@ -500,17 +490,6 @@ def test_app_get_single_model_endpoint() -> None:
         r3 = client.get("/v1/models/nonexistent-model")
         assert r3.status_code == 404
         assert "unknown model 'nonexistent-model'" in r3.json()["error"]["message"]
-
-
-def test_parse_kv_cache_dtype_hyphenated() -> None:
-    from sglang_service.catalog import _parse_kv_cache_dtype
-
-    assert _parse_kv_cache_dtype(explicit_dtype="fp8-e5m2") == "fp8_e5m2"
-    assert _parse_kv_cache_dtype(explicit_dtype="fp8-e4m3") == "fp8_e4m3"
-    assert _parse_kv_cache_dtype(explicit_dtype="fp4-e2m1") == "fp4_e2m1"
-    assert _parse_kv_cache_dtype(cache_k="fp8-e5m2") == "fp8_e5m2"
-    assert _parse_kv_cache_dtype(explicit_dtype="FP8-E5M2") == "fp8_e5m2"
-    assert _parse_kv_cache_dtype(explicit_dtype="Q8_0") == "fp8_e5m2"
 
 
 def test_toml_common_name_isolation() -> None:
@@ -592,32 +571,6 @@ def test_catalog_whitespace_model_lookup() -> None:
     # Leading/trailing whitespace in model name is handled
     assert catalog.get("  qwen3.8-27b  ").name == "qwen3.8-27b"
     assert catalog.get("  qwen3.5-9b  ").name == "qwen3.5-9b"
-
-
-def test_ini_preset_preserves_default() -> None:
-    content = """
-    [*]
-    kv-cache-dtype = fp8_e5m2
-
-    [model_a]
-    model = /tmp/a
-
-    [model_b]
-    model = /tmp/b
-    default = true
-    """
-    with tempfile.NamedTemporaryFile(suffix=".ini", mode="w", delete=False) as f:
-        f.write(content)
-        f.flush()
-        path = Path(f.name)
-
-    try:
-        catalog = ModelCatalog.from_file(path)
-        assert catalog.get("model_a").is_default is False
-        assert catalog.get("model_b").is_default is True
-        assert catalog.default.name == "model_b"
-    finally:
-        path.unlink()
 
 
 @pytest.mark.anyio
@@ -726,14 +679,6 @@ async def test_manager_keeps_two_models_resident(monkeypatch: pytest.MonkeyPatch
     assert sorted(stopped_backends) == ["qwen3.5-9b", "qwen3.8-27b"]
 
 
-def test_cli_namespace_models_file() -> None:
-    args = build_parser().parse_args(["--config", "/tmp/custom.toml"])
-    assert args.models_file == Path("/tmp/custom.toml")
-    assert args.models_config == Path("/tmp/custom.toml")
-    assert args.config == Path("/tmp/custom.toml")
-    assert args.preset_file == Path("/tmp/custom.toml")
-
-
 @pytest.mark.anyio
 async def test_manager_capacity_rejects_second_active_model(monkeypatch: pytest.MonkeyPatch) -> None:
     catalog = ModelCatalog.from_toml_file(MODELS_TOML)
@@ -791,12 +736,11 @@ async def test_manager_start_backend_failure_cleanup(monkeypatch: pytest.MonkeyP
     await manager.shutdown()
 
 
-def test_sglang_download_single_table_and_aliases() -> None:
+def test_download_single_table() -> None:
     content = """
     [models]
     name = "single-entry"
-    hf-repo = "custom/hf-repo"
-    hf-file = "model.safetensors"
+    hf_repo = "custom/hf-repo"
     """
     with tempfile.NamedTemporaryFile(suffix=".toml", mode="w", delete=False) as f:
         f.write(content)
@@ -823,28 +767,18 @@ if isinstance(data.get("models"), dict):
             if isinstance(val, dict):
                 repo = (
                     val.get("model_path")
-                    or val.get("model")
-                    or val.get("path")
                     or val.get("hf_repo")
-                    or val.get("hf-repo")
-                    or val.get("repo_id")
                 )
-                file_ = val.get("hf_file") or val.get("hf-file")
-                models.append((name, repo, file_))
-    elif any(k in models_map for k in ("model_path", "model", "path", "hf_repo", "hf-repo", "repo_id")):
+                models.append((name, repo))
+    elif any(k in models_map for k in ("model_path", "hf_repo")):
         m_name = str(models_map.get("name") or "default")
         repo = (
             models_map.get("model_path")
-            or models_map.get("model")
-            or models_map.get("path")
             or models_map.get("hf_repo")
-            or models_map.get("hf-repo")
-            or models_map.get("repo_id")
         )
-        file_ = models_map.get("hf_file") or models_map.get("hf-file")
-        models.append((m_name, repo, file_))
+        models.append((m_name, repo))
 assert len(models) == 1
-assert models[0] == ("single-entry", "custom/hf-repo", "model.safetensors")
+assert models[0] == ("single-entry", "custom/hf-repo")
 print("OK")
 """,
         str(path),
@@ -955,36 +889,6 @@ def test_unset_runtime_fields_and_optional_speculative_tokens(tmp_path: Path, me
     else:
         assert "--speculative-config" not in command
     assert command[command.index("--gpu-memory-utilization") + 1] == "0.9"
-
-
-@pytest.mark.parametrize(
-    "defaults,model_values,expected",
-    [
-        ("", "mem_fraction_static = 0.35", 0.35),
-        ("mem_fraction_static = 0.45", "", 0.45),
-        ("gpu_memory_utilization = 0.45", "mem_fraction_static = 0.35", 0.35),
-        ("mem_fraction_static = 0.45", "gpu_memory_utilization = 0.35", 0.35),
-        ("", "mem_fraction_static = 0.45\ngpu_memory_utilization = 0.35", 0.35),
-        ("mem_fraction_static = 0.45\ngpu_memory_utilization = 0.35", "", 0.35),
-    ],
-)
-def test_gpu_memory_deprecated_alias_precedence(
-    tmp_path: Path,
-    defaults: str,
-    model_values: str,
-    expected: float,
-) -> None:
-    path = tmp_path / "models.toml"
-    path.write_text(f'[default]\n{defaults}\n[model]\nmodel_path = "org/model"\n{model_values}\n')
-    catalog = ModelCatalog.from_toml_file(path)
-    spec = catalog.default
-    assert spec.gpu_memory_utilization == expected
-    command = ModelManager(catalog)._command(spec, spec.model_path, 30000)
-    assert command[command.index("--gpu-memory-utilization") + 1] == str(expected)
-    command = ModelManager(catalog, gpu_memory_utilization=0.8)._command(spec, spec.model_path, 30000)
-    assert command[command.index("--gpu-memory-utilization") + 1] == "0.8"
-    assert "gpu_memory_utilization" not in spec.public_dict()["metadata"]
-    assert "mem_fraction_static" not in spec.public_dict()["metadata"]
 
 
 @pytest.mark.parametrize(

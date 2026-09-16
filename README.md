@@ -149,8 +149,6 @@ VLLM_GRACEFUL_SHUTDOWN_TIMEOUT
 VLLM_PID_FILE / VLLM_LOG_FILE
 ```
 
-舊的 `SGLANG_CONFIG_FILE`、`SGLANG_MODELS_FILE`、`SGLANG_DIR` 等同義環境變數仍保留為低優先級相容 fallback；新設定應使用 `VLLM_*`。
-
 ## API
 
 Liveness 與 resident 狀態：
