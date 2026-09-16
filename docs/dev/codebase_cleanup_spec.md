@@ -182,7 +182,7 @@ TOML 結構方言（root named tables、`[models.<name>]` map、`[[models]]` arr
 - R3.5 logger 名稱：`app.py`、`manager.py` 的 `logging.getLogger("sglang_service")` → `"vllm_gateway"`。
 - R3.6 tests imports：`tests/test_catalog.py`、`tests/test_app.py`、`tests/test_manager.py` 的 `from sglang_service...` → `from vllm_gateway...`（含 function body 內的 local import，全檔替換）；`tests/test_script.py` 的 fake server 檔名 `sglang_service_fake.py` → `vllm-gateway-fake.py`（檔名需含 `vllm-gateway` 子串，companion script 的 `pid_matches_gateway` 在 cutover 前後都能認得這個 fake process）；`test_sglang_download_single_table_and_aliases`（若 R2.5 後仍存在）改名 `test_single_table_and_aliases`。
 - R3.7 docs：`docs/architecture.md`（元件清單 line 11-17 的路徑與 entry 清單）、`docs/development.md`（entry points 段）、`README.md`（`python -m sglang_service` 三處、`main.py` 提及）、root `AGENTS.md`（Instruction Index、Verification 命令）、`sglang_service/AGENTS.md` → `vllm_gateway/AGENTS.md`（`git mv`，內文 line 3 路徑）。歷史 spec（`docs/dev/vllm_config_migration_spec.md`、本檔）不改寫。
-- R3.8 companion script（repo 外，cutover 時 in-place 編輯，不在本 slice 的 worktree commit 內）：`start()` 三處 `python -m sglang_service` → `python -m vllm_gateway`；`pid_matches_gateway` 的 `sglang_service` pattern → `vllm_gateway`、移除 `main.py` pattern。cutover 順序見 §10。
+- R3.8 companion script（repo 外，cutover 時 in-place 編輯，不在本 slice 的 worktree commit 內）：`start()` 三處 `python -m sglang_service` → `python -m vllm_gateway`；`pid_matches_gateway` 的 `sglang_service` pattern → `vllm_gateway`、移除 `main.py` pattern；`download` 子命令內 `from sglang_service.catalog import ModelCatalog` → `from vllm_gateway.catalog import ModelCatalog`。cutover 順序見 §10。
 
 ### 檔案邊界
 
