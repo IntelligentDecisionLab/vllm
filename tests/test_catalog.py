@@ -427,7 +427,7 @@ def test_resolve_model_path_env_var_and_tilde() -> None:
 
 
 def test_companion_script_defaults() -> None:
-    script_path = Path.home() / ".local" / "bin" / "vllm"
+    script_path = REPO_ROOT / "scripts" / "vllm"
     assert script_path.is_file()
     content = script_path.read_text(encoding="utf-8")
     assert 'PROJECT_DIR="${VLLM_PROJECT_DIR:-$HOME/Projects/vllm}"' in content

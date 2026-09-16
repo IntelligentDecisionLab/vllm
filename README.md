@@ -114,9 +114,15 @@ uv run python -m vllm_gateway \
 
 Identity、network 與 catalog 管理的 resource flags 不能透過 `--vllm-arg` 覆寫；例如 `--port`、`--model`、`--served-model-name`、TP/DP、memory、context 與 KV cache。這類設定應使用 catalog 或 gateway 的正式 CLI option。
 
-## `~/.local/bin/vllm` 管理工具
+## Companion script（`scripts/vllm`）
 
-Companion script 預設使用 `/home/sam/Projects/vllm`，也可設定 `VLLM_PROJECT_DIR`。它只管理 gateway PID；backend children 全由 `ModelManager` 在 graceful shutdown 中停止，不會使用 `fuser`、`pgrep` 或 port regex 猜測 process ownership。
+Companion script 放在 repository 的 `scripts/vllm`。首次安裝到 `~/.local/bin/vllm`：
+
+```bash
+install -m 755 scripts/vllm ~/.local/bin/vllm
+```
+
+Script 預設使用 `/home/sam/Projects/vllm`，也可設定 `VLLM_PROJECT_DIR`。它只管理 gateway PID；backend children 全由 `ModelManager` 在 graceful shutdown 中停止，不會使用 `fuser`、`pgrep` 或 port regex 猜測 process ownership。
 
 ```bash
 vllm start

@@ -8,7 +8,7 @@ import textwrap
 import time
 from pathlib import Path
 
-SCRIPT = Path.home() / ".local" / "bin" / "vllm"
+SCRIPT = Path(__file__).parent.parent / "scripts" / "vllm"
 
 
 def free_port() -> int:

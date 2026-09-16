@@ -7,7 +7,7 @@
 - `test_catalog.py` 覆蓋 catalog shape、legacy compatibility、CLI/env parsing、command generation 與 request defaults。
 - `test_app.py` 以 `TestClient` 和 `FakeManager` 驗證 HTTP routing、stream cleanup、management API 與 reload。
 - `test_manager.py` 全檔使用 AnyIO；以 `FakeProcess`、`asyncio.Event` 和 monkeypatch 控制並行 lifecycle。
-- `test_script.py` 驗證部署環境的 `~/.local/bin/vllm`。該 script 不在 repository 內，測試依賴目前工作站的固定路徑。
+- `test_script.py` 驗證 repository 內的 `scripts/vllm`，涵蓋 start/status/load/unload/restart/stop 行為和 process ownership 防護。部署時再將該檔案安裝到 `~/.local/bin/vllm`。
 
 ## Local Conventions
 

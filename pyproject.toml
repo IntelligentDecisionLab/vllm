@@ -38,6 +38,3 @@ build-backend = "hatchling.build"
 
 [tool.hatch.build.targets.wheel]
 packages = ["vllm_gateway"]
-
-[tool.hatch.build.targets.wheel.force-include]
-"models.toml" = "models.toml"

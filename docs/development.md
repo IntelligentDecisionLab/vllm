@@ -29,7 +29,7 @@ uv run python -m vllm_gateway --preload
 - `tests/test_catalog.py`：TOML/legacy INI parsing、CLI/env precedence、command generation、model defaults，以及部分 compatibility tests。
 - `tests/test_app.py`：FastAPI routing、stream lease cleanup、management API 與 hot reload。
 - `tests/test_manager.py`：async lifecycle、concurrent startup、capacity、drain、crash、port ownership 與 reload invariants。
-- `tests/test_script.py`：以 temporary fake service 測試 `~/.local/bin/vllm` 的 start/status/load/unload/restart/stop 行為和 process ownership 防護。
+- `tests/test_script.py`：以 temporary fake service 測試 repository 內 `scripts/vllm` 的 start/status/load/unload/restart/stop 行為和 process ownership 防護。
 
 完整驗證：
 
@@ -92,7 +92,13 @@ Repository 尚未配置 type-check gate。
 
 ### Companion script
 
-Script 不在 repository 內，但 `tests/test_script.py` 固定讀取 `~/.local/bin/vllm`。變更部署 script 時要在同一環境執行該測試。若要讓專案可移植地安裝 script，應先把 script 納入 repository 與 packaging，再調整測試路徑；不要只修改測試繞過現況。
+Companion script 版本位於 repository 的 `scripts/vllm`，`tests/test_script.py` 和 `test_catalog.py` 都讀取這份檔案。部署時首次安裝到 `~/.local/bin/vllm`：
+
+```bash
+install -m 755 scripts/vllm ~/.local/bin/vllm
+```
+
+修改 script 後，執行 `uv run --extra test python -m pytest -q tests/test_script.py` 驗證 lifecycle 和 process ownership 行為。
 
 ## GPU smoke test
 
