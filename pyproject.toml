@@ -16,7 +16,7 @@ dependencies = [
 # the gateway can be inspected and tested on a CPU-only machine, while the
 # normal GPU install remains: `uv sync --extra runtime`.
 runtime = [
-    "vllm==0.27.1",
+    "vllm==0.28.0",
 ]
 test = ["pytest>=8.0"]
 dev = ["ruff>=0.14"]
