@@ -33,7 +33,8 @@ reasoning_parser = "qwen3"
 tool_call_parser = "qwen3_coder"
 default = true
 aliases = ["qwen3.8-27b-fp8"]
-num_speculative_tokens = 3
+attention_backend = "flashinfer"
+num_speculative_tokens = 2
 
 # --- 2. 批次實驗專用 (9B 使用 GPU 1，與 27B 共用) ---
 ["qwen3.5-9b"]
