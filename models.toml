@@ -16,8 +16,8 @@ attention_backend = "flashinfer"
 async_scheduling = true
 flashinfer_autotune = true
 enable_prefix_caching = true
-speculative_method = "mtp"
-num_speculative_tokens = 2
+# speculative (MTP) 改為 per-model 宣告：pooling/convert backend 不得繼承
+# （TOML 無法清除繼承值，manager 無負向 flag，見 manager.py 的 --speculative-config 生成邏輯）
 
 # --- 1. Local Coding Agent 專用 (27B 使用雙 GPU) ---
 ["qwen3.8-27b"]
@@ -34,6 +34,7 @@ tool_call_parser = "qwen3_coder"
 default = true
 aliases = ["qwen3.8-27b-fp8"]
 attention_backend = "flashinfer"
+speculative_method = "mtp"
 num_speculative_tokens = 2
 
 # --- 2. 批次實驗專用 (9B 使用 GPU 1，與 27B 共用) ---
@@ -50,3 +51,5 @@ reasoning_parser = "qwen3"
 tool_call_parser = "qwen3_coder"
 aliases = ["qwen3.5-9b"]
 device_ids = [1]
+speculative_method = "mtp"
+num_speculative_tokens = 2
