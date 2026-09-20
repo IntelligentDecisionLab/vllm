@@ -790,7 +790,7 @@ print("OK")
         path.unlink()
 
 
-@pytest.mark.parametrize("name,tokens,devices", [("qwen3.8-27b", 3, None), ("qwen3.5-9b", 2, (1,))])
+@pytest.mark.parametrize("name,tokens,devices", [("qwen3.8-27b", 2, None), ("qwen3.5-9b", 2, (1,))])
 def test_migrated_catalog_runtime_fields(name: str, tokens: int, devices: tuple[int, ...] | None) -> None:
     catalog = ModelCatalog.from_toml_file(MODELS_TOML)
     spec = catalog.get(name)
