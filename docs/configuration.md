@@ -1,77 +1,77 @@
-# 設定與檔案放置
+# Configuration and file placement
 
-## 設定來源與優先級
+## Configuration sources and precedence
 
-Gateway 預設讀取 repository root 的 `models.toml`。`--config` 可指定其他 TOML。
+The gateway reads `models.toml` from the repository root by default. `--config` can specify another TOML file.
 
-單一 backend command 的設定優先級為：
+The configuration precedence for a single backend command is:
 
-1. Gateway CLI 或對應 `VLLM_*` 環境變數提供的全域 override。
-2. `models.toml` 的 per-model 欄位。
-3. `[default]` 合併到 model entry 的值。
-4. `ModelManager` 的內建 fallback。
+1. Global overrides provided by the gateway CLI or the corresponding `VLLM_*` environment variables.
+2. Per-model fields in `models.toml`.
+3. Values merged from `[default]` into the model entry.
+4. Built-in fallbacks in `ModelManager`.
 
-例如 TP、DP、GPU memory、sequence/token budget、attention backend 與 context 都依此規則解析。全域 override 會影響每個 model，部署前需確認沒有破壞各 GPU 的隔離配置。
+TP, DP, GPU memory, sequence/token budgets, attention backend, and context are all resolved according to these rules. Global overrides affect every model, so verify before deployment that they do not break GPU isolation settings.
 
 ## `models.toml`
 
-`[default]` 放所有 model 共用的值；`["canonical-name"]` 放 model source 與 override。現有 parser 也接受 `[models.<name>]` map 和 `[[models]]` array-of-tables，但 repository 本身使用 root named tables。
+`[default]` contains values shared by all models; `["canonical-name"]` contains the model source and overrides. The current parser also accepts a `[models.<name>]` map and a `[[models]]` array of tables, but the repository itself uses root-level named tables.
 
-常用 typed fields：
+Common typed fields:
 
-| 類別             | 欄位                                                                                                          |
-| ---------------- | ------------------------------------------------------------------------------------------------------------- |
-| Identity         | `model_path`, `hf_repo`, `aliases`, `default`                                                               |
-| Capacity         | `tensor_parallel_size`, `data_parallel_size`, `gpu_memory_utilization`, `max_num_seqs`, `max_num_batched_tokens` |
-| Context/KV       | `context_length`, `kv_cache_dtype`, `rope_scaling`, `rope_scale`, `yarn_orig_ctx`, `rope_theta`               |
-| Request behavior | `reasoning`, `reasoning_parser`, `tool_call_parser`, `chat_template`                                          |
-| Lifecycle        | `idle_seconds`                                                                                                |
-| Runtime          | `attention_backend`, `device_ids`, `async_scheduling`, `flashinfer_autotune`, `enable_prefix_caching`, `vllm_args`                                                                              |
+| Category | Fields |
+| --- | --- |
+| Identity | `model_path`, `hf_repo`, `aliases`, `default` |
+| Capacity | `tensor_parallel_size`, `data_parallel_size`, `gpu_memory_utilization`, `max_num_seqs`, `max_num_batched_tokens` |
+| Context/KV | `context_length`, `kv_cache_dtype`, `rope_scaling`, `rope_scale`, `yarn_orig_ctx`, `rope_theta` |
+| Request behavior | `reasoning`, `reasoning_parser`, `tool_call_parser`, `chat_template` |
+| Lifecycle | `idle_seconds` |
+| Runtime | `attention_backend`, `device_ids`, `async_scheduling`, `flashinfer_autotune`, `enable_prefix_caching`, `vllm_args` |
 | Speculative decoding | `speculative_method`, `num_speculative_tokens` |
 
-`device_ids` 使用 TOML 整數陣列（例如 `[0, 1]`）；`async_scheduling`、`flashinfer_autotune`、`enable_prefix_caching` 使用 boolean。未設定時不輸出 flag，`false` 會輸出對應 `--no-` flag，以覆寫 default 的 `true`。`speculative_method` 使用字串，`num_speculative_tokens` 使用整數；只有設定 method 時才產生 `--speculative-config`，tokens 可省略。這些新欄位支援 `[default]` 與 per-model，沒有新增 CLI/env override。
+`device_ids` uses a TOML integer array (for example, `[0, 1]`); `async_scheduling`, `flashinfer_autotune`, and `enable_prefix_caching` use booleans. When unset, no flag is emitted; `false` emits the corresponding `--no-` flag to override a default of `true`. `speculative_method` is a string and `num_speculative_tokens` is an integer; `--speculative-config` is generated only when a method is set, and the token count may be omitted. These new fields support `[default]` and per-model values and have no additional CLI/environment override.
 
-`model_path` 可指向本機 Transformers/Safetensors 目錄或 Hugging Face repo ID。若它看起來是明確的本機路徑但不存在，gateway 會報錯。
+`model_path` can point to a local Transformers/Safetensors directory or a Hugging Face repo ID. If it looks like an explicit local path but does not exist, the gateway reports an error.
 
-Canonical name、normalized name、alias、model path、source 與 Hugging Face repo 必須在整份 catalog 中唯一。名稱衝突會使 gateway 在 bind public port 前停止。
+The canonical name, normalized name, alias, model path, source, and Hugging Face repo must each be unique across the entire catalog. A name conflict stops the gateway before it binds the public port.
 
-### 共用 GPU 的記憶體 budget
+### Shared GPU memory budget
 
-`gpu_memory_utilization` 會轉成 vLLM 的 `--gpu-memory-utilization`，其值是 GPU **總記憶體**的比例，不是啟動當下 free memory 的比例。vLLM 啟動時要求 free memory 至少能覆蓋 `total memory × gpu_memory_utilization`；同卡的外部程序若先占用太多記憶體，backend 會在載入權重前退出。
+`gpu_memory_utilization` is converted to vLLM's `--gpu-memory-utilization`; its value is a fraction of the GPU's **total memory**, not of the free memory at startup. At startup, vLLM requires free memory to cover at least `total memory × gpu_memory_utilization`; if an external process on the same GPU has already consumed too much memory, the backend exits before loading weights.
 
-2026-08-27 的 `qwen3.5-9b` incident 中，GPU 1 剩餘 30.64 GiB，但 `0.35` 要求 33.24 GiB，因此 `vllm load` 回 503。將該 model 的值降為 `0.30`（28.49 GiB budget）並 hot reload 後，backend 完成權重載入、CUDA graph capture 與 readiness。
+In the `qwen3.5-9b` incident on 2026-08-27, GPU 1 had 30.64 GiB remaining, but `0.35` required 33.24 GiB, so `vllm load` returned 503. After lowering that model's value to `0.30` (a 28.49 GiB budget) and hot-reloading, the backend completed weight loading, CUDA graph capture, and readiness.
 
-遇到同類錯誤時：
+When you encounter a similar error:
 
-1. 用 `nvidia-smi` 確認目標 GPU 的 free memory 與其他 process。
-2. 從 backend stderr 找出 vLLM 回報的 free/desired GiB；gateway 的 503 只摘要 subprocess exit。
-3. 移除不應共存的 process，或降低該 model 的 `gpu_memory_utilization`，並保留權重、activation、CUDA graph 和 KV cache 所需空間。
-4. 執行 `POST /admin/reload` 後重新 load；確認 `/health` 進入 `ready`，再送 completion smoke test。
+1. Use `nvidia-smi` to check free memory on the target GPU and the other processes using it.
+2. Find the free/desired GiB reported by vLLM in the backend stderr; the gateway's 503 only summarizes the subprocess exit.
+3. Remove processes that should not coexist, or lower that model's `gpu_memory_utilization`, while preserving the space needed for weights, activations, CUDA graphs, and the KV cache.
+4. Run `POST /admin/reload` and load the model again; confirm that `/health` reaches `ready`, then send a completion smoke test.
 
-不要把目前 free memory 全部換算成 fraction。共用 GPU 的使用量會變動，貼近臨界值會讓下次啟動再次失敗。
+Do not convert all currently free memory into a fraction. Shared GPU usage changes, and operating near the limit can cause the next startup to fail again.
 
-### `vllm_args` 邊界
+### `vllm_args` boundary
 
-`vllm_args` 只放 gateway 沒有 typed field 的安全上游參數。以下類別由 gateway 管理，不能在 `vllm_args` 或 `--vllm-arg` 覆寫：
+`vllm_args` is only for safe upstream parameters for which the gateway has no typed field. The gateway manages the following categories, which cannot be overridden in `vllm_args` or with `--vllm-arg`:
 
-- model identity、host、port、served model name
-- TP/DP、GPU memory、context、sequence/token budget、KV dtype
-- load format、runner、reasoning/tool parser、chat template
-- attention backend 與 Hugging Face overrides
-- `--device-ids`、`--async-scheduling`、`--enable-flashinfer-autotune`、`--speculative-config`
-- `--enable-chunked-prefill`、`--enable-prefix-caching`、`--enable-auto-tool-choice`
+- model identity, host, port, and served model name
+- TP/DP, GPU memory, context, sequence/token budget, and KV dtype
+- load format, runner, reasoning/tool parser, and chat template
+- attention backend and Hugging Face overrides
+- `--device-ids`, `--async-scheduling`, `--enable-flashinfer-autotune`, and `--speculative-config`
+- `--enable-chunked-prefill`, `--enable-prefix-caching`, and `--enable-auto-tool-choice`
 
-Protected flags 的 underscore 拼法、`--flag=value` 與 `--no-<flag>` 形態同樣被拒絕。
+Protected flags are also rejected in underscore spelling, `--flag=value` form, and `--no-<flag>` form.
 
-目前 catalog 的生成模型使用 V1 chunked prefill default，已移除重複的 `--enable-chunked-prefill`。Prefix caching 的 default 依模型能力與 hybrid 架構決定；Qwen hybrid 模型保留 `enable_prefix_caching = true`，維持遷移前明確啟用的行為。
+The current catalog's generative models use the V1 chunked-prefill default, so the duplicate `--enable-chunked-prefill` has been removed. The prefix-caching default depends on model capabilities and the hybrid architecture; Qwen hybrid models retain `enable_prefix_caching = true` to preserve the behavior that was explicitly enabled before migration.
 
-Gateway 保留自己的 fallback：`gpu_memory_utilization = 0.90`、`max_num_seqs = 256`、`max_num_batched_tokens = 4096`。vLLM 0.27.1 的 GPU memory default 為 `0.92`；`SchedulerConfig` 的 seq/token dataclass default 為 `128` / `2048`，但 `EngineArgs` 啟動時會依裝置與 usage 自動調整。Catalog 或全域 override 仍優先於 gateway fallback。
+The gateway retains its own fallbacks: `gpu_memory_utilization = 0.90`, `max_num_seqs = 256`, and `max_num_batched_tokens = 4096`. In vLLM 0.27.1, the GPU memory default is `0.92`; the `SchedulerConfig` seq/token dataclass defaults are `128` / `2048`, but `EngineArgs` adjusts them automatically at startup based on the device and usage. Catalog or global overrides still take precedence over gateway fallbacks.
 
-需要新增受管理參數時，修改 `ModelSpec`、catalog parser、CLI/manager precedence 和 command-generation tests。不要從 protected set 移除 flag 來規避 validation。
+When adding a managed parameter, update `ModelSpec`, the catalog parser, CLI/manager precedence, and command-generation tests. Do not remove a flag from the protected set to bypass validation.
 
-## 環境變數
+## Environment variables
 
-Gateway source 直接支援主要的 `VLLM_*` 設定，包括：
+The gateway source directly supports the main `VLLM_*` settings, including:
 
 ```text
 VLLM_CONFIG_FILE
@@ -90,27 +90,27 @@ VLLM_MODEL_IDLE_SECONDS
 VLLM_SERVICE_LOG_LEVEL
 ```
 
-部署用 companion script 支援更多 lifecycle 變數，例如 preload、PID/log path 與 stop timeout；該 script 在 repo 的 `scripts/vllm`，部署時安裝到 `~/.local/bin/vllm`。
+The deployment companion script supports additional lifecycle variables such as preload, PID/log paths, and stop timeout. The script is in `scripts/vllm` in the repository and is installed to `~/.local/bin/vllm` for deployment.
 
-## 檔案放置
+## File placement
 
-| 內容                                           | 位置                                                                        | 誰讀取                                |
-| ---------------------------------------------- | --------------------------------------------------------------------------- | ------------------------------------- |
-| 可版本控制的 model catalog                     | `models.toml` 或 `VLLM_CONFIG_FILE` 指定的檔案                              | `ModelCatalog`、companion script      |
-| Python package metadata 與 locked dependencies | `pyproject.toml`, `uv.lock`                                                 | uv、build backend                     |
-| 架構與開發規範                                 | `docs/`, 各層 `AGENTS.md`                                                   | 人員與 coding agents                  |
-| Model 權重與 Hugging Face cache                | repository 外的本機 model path 或 Hugging Face cache                        | vLLM、huggingface-hub                 |
-| Gateway PID/log                                | 預設 `~/.cache/vllm-gateway.pid`、`~/.cache/vllm-gateway.log`               | companion script                      |
-| Python/test/build artifacts                    | `.venv/`, `__pycache__/`, `.pytest_cache/`, `build/`, `dist/`, `*.egg-info` | 開發工具；不要提交                    |
-| Agent harness state                            | `.agents/`, `.pi/`                                                          | agent tooling；已由 `.gitignore` 排除 |
+| Content | Location | Readers |
+| --- | --- | --- |
+| Version-controlled model catalog | `models.toml` or the file specified by `VLLM_CONFIG_FILE` | `ModelCatalog`, companion script |
+| Python package metadata and locked dependencies | `pyproject.toml`, `uv.lock` | uv, build backend |
+| Architecture and development guidelines | `docs/`, each level's `AGENTS.md` | people and coding agents |
+| Model weights and Hugging Face cache | local model path or Hugging Face cache outside the repository | vLLM, huggingface-hub |
+| Gateway PID/log | `~/.cache/vllm-gateway.pid`, `~/.cache/vllm-gateway.log` by default | companion script |
+| Python/test/build artifacts | `.venv/`, `__pycache__/`, `.pytest_cache/`, `build/`, `dist/`, `*.egg-info` | development tools; do not commit |
+| Agent harness state | `.agents/`, `.pi/` | agent tooling; excluded by `.gitignore` |
 
 ## Secrets
 
-Repository 沒有自建 API key 或 secret-file loader。Hugging Face token、代理憑證或其他部署 secret 應透過 process environment、Hugging Face credential store 或外部 secret manager 提供。不要把 token 寫進 `models.toml`、README、docs、test fixture 或 log 範例。
+The repository does not implement its own API key or secret-file loader. Hugging Face tokens, proxy credentials, and other deployment secrets should be provided through the process environment, the Hugging Face credential store, or an external secret manager. Do not put tokens in `models.toml`, README, docs, test fixtures, or log examples.
 
-## 安全更新流程
+## Safe update workflow
 
-1. 編輯 catalog 後先執行 catalog 與 command-generation tests。
-2. 呼叫 `POST /admin/reload`；先檢查回應中的 `added`、`removed`、`updated`、`kept_loaded`。
-3. 檢查 `/health` 和 `/v1/models`。需要載入權重時，再執行目標 model 的 GPU smoke test。
-4. Reload 失敗時不要重啟來掩蓋 parser 問題；服務會保留舊 catalog，先修正回應與 log 指出的設定錯誤。
+1. After editing the catalog, first run the catalog and command-generation tests.
+2. Call `POST /admin/reload`; first inspect the `added`, `removed`, `updated`, and `kept_loaded` fields in the response.
+3. Check `/health` and `/v1/models`. If weights need to be loaded, then run a GPU smoke test for the target model.
+4. When reload fails, do not restart to mask the parser problem; the service retains the old catalog, so first correct the configuration error indicated by the response and log.

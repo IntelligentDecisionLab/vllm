@@ -1,14 +1,14 @@
-# 開發與驗證
+# Development and verification
 
-## 環境
+## Environment
 
-專案要求 Python 3.12 以上，使用 uv 管理 lock file。Gateway 的 FastAPI/httpx 單元測試不需要 GPU；vLLM 是 optional runtime dependency。
+The project requires Python 3.12 or newer and uses uv to manage the lock file. The gateway's FastAPI/httpx unit tests do not require a GPU; vLLM is an optional runtime dependency.
 
 ```bash
 uv sync --extra runtime --extra test
 ```
 
-只開發 gateway 且不載入模型時，可省略 `runtime` extra：
+When developing only the gateway without loading models, you can omit the `runtime` extra:
 
 ```bash
 uv sync --extra test
@@ -22,22 +22,22 @@ uv run python -m vllm_gateway
 uv run python -m vllm_gateway --preload
 ```
 
-`pyproject.toml` 的 `vllm-service`、`vllm-gateway` scripts 都呼叫相同的 CLI main。
+The `vllm-service` and `vllm-gateway` scripts in `pyproject.toml` both call the same CLI main function.
 
-## 測試分區
+## Test areas
 
-- `tests/test_catalog.py`：TOML parsing、CLI/env precedence、command generation、model defaults，以及部分 compatibility tests。
-- `tests/test_app.py`：FastAPI routing、stream lease cleanup、management API 與 hot reload。
-- `tests/test_manager.py`：async lifecycle、concurrent startup、capacity、drain、crash、port ownership 與 reload invariants。
-- `tests/test_script.py`：以 temporary fake service 測試 repository 內 `scripts/vllm` 的 start/status/load/unload/restart/stop 行為和 process ownership 防護。
+- `tests/test_catalog.py`: TOML parsing, CLI/environment precedence, command generation, model defaults, and some compatibility tests.
+- `tests/test_app.py`: FastAPI routing, stream lease cleanup, management API, and hot reload.
+- `tests/test_manager.py`: asynchronous lifecycle, concurrent startup, capacity, draining, crashes, port ownership, and reload invariants.
+- `tests/test_script.py`: start/status/load/unload/restart/stop behavior of the repository's `scripts/vllm`, tested with a temporary fake service, and process ownership protection.
 
-完整驗證：
+Full verification:
 
 ```bash
 uv run --extra test python -m pytest -q
 ```
 
-依修改範圍縮小迴圈：
+Narrow the loop according to the scope of the change:
 
 ```bash
 uv run --extra test python -m pytest -q tests/test_catalog.py
@@ -45,17 +45,17 @@ uv run --extra test python -m pytest -q tests/test_app.py tests/test_manager.py
 uv run --extra test python -m pytest -q tests/test_script.py
 ```
 
-Package build：
+Package build:
 
 ```bash
 uv build
 ```
 
-## CI 與 Ruff gate
+## CI and Ruff gates
 
-GitHub Actions 在推送到 `main` 或建立、更新 pull request 時執行，使用 Python 3.12 的 CPU-only runner。CI 會安裝 `test` 與 `dev` extras，依序執行 Ruff lint、Ruff format 檢查和完整 pytest suite；不會安裝需要 GPU/CUDA 的 `runtime` extra。
+GitHub Actions runs on pushes to `main` and when pull requests are opened or updated, using a Python 3.12 CPU-only runner. CI installs the `test` and `dev` extras, then runs Ruff linting, Ruff format checks, and the full pytest suite in order; it does not install the GPU/CUDA-dependent `runtime` extra.
 
-本機可用以下命令執行相同檢查：
+Run the same checks locally with:
 
 ```bash
 uv sync --extra test --extra dev
@@ -64,7 +64,7 @@ uv run --extra dev ruff format --check .
 uv run --extra test python -m pytest -q
 ```
 
-安裝 pre-commit 後，提交前會自動執行 Ruff 修正與格式化：
+After installing pre-commit, commits automatically run Ruff fixes and formatting:
 
 ```bash
 uv tool install pre-commit
@@ -72,37 +72,37 @@ pre-commit install
 pre-commit run --all-files
 ```
 
-Repository 尚未配置 type-check gate。
+The repository does not yet have a type-check gate.
 
-## 修改工作流
+## Change workflow
 
-### Catalog field 或 command option
+### Catalog field or command option
 
-1. 在 `ModelSpec` 加 typed field，並在 TOML parser 處理支援的 key spelling。
-2. 在 `ModelManager._command()` 明確定義 CLI override、model spec 與 fallback 的 precedence。
-3. 若 vLLM option 由 gateway 管理，把它列入 protected flags，避免 `vllm_args` 產生重複或互相衝突的參數。
-4. 更新 catalog parsing 與 command-generation tests，再同步 `models.toml` 和使用者文件。
+1. Add a typed field to `ModelSpec` and handle supported key spellings in the TOML parser.
+2. Define the precedence of CLI overrides, model specs, and fallbacks explicitly in `ModelManager._command()`.
+3. If vLLM manages the option, add it to the protected flags so that `vllm_args` cannot generate duplicate or conflicting arguments.
+4. Update catalog-parsing and command-generation tests, then synchronize `models.toml` and the user documentation.
 
-### Proxy 或 lifecycle
+### Proxy or lifecycle
 
-- Proxy 每條成功 acquire 的路徑都必須 release lease，包括 HTTP error、SSE close、client cancellation 與未預期 exception。
-- Manager concurrency tests 使用 `FakeProcess`、`asyncio.Event` 和 monkeypatch 控制 startup/stop，不啟動真實 vLLM。
-- 修改 state transition 時需涵蓋 concurrent first load、等待者 cancellation、active unload、drain timeout、process crash 和 shutdown。
-- 不得以 `fuser`、`pgrep`、port regex 或全機 process scan 猜測 ownership。
+- Every successful acquire path in the proxy must release its lease, including HTTP errors, SSE close, client cancellation, and unexpected exceptions.
+- Manager concurrency tests use `FakeProcess`, `asyncio.Event`, and monkeypatching to control startup/stop without starting real vLLM.
+- State-transition changes must cover concurrent first loads, waiter cancellation, active unload, drain timeout, process crashes, and shutdown.
+- Do not infer ownership with `fuser`, `pgrep`, port regexes, or a machine-wide process scan.
 
 ### Companion script
 
-Companion script 版本位於 repository 的 `scripts/vllm`，`tests/test_script.py` 和 `test_catalog.py` 都讀取這份檔案。部署時首次安裝到 `~/.local/bin/vllm`：
+The companion script version is in `scripts/vllm` in the repository; both `tests/test_script.py` and `test_catalog.py` read this file. Install it to `~/.local/bin/vllm` the first time for deployment:
 
 ```bash
 install -m 755 scripts/vllm ~/.local/bin/vllm
 ```
 
-修改 script 後，執行 `uv run --extra test python -m pytest -q tests/test_script.py` 驗證 lifecycle 和 process ownership 行為。
+After modifying the script, run `uv run --extra test python -m pytest -q tests/test_script.py` to verify lifecycle and process ownership behavior.
 
 ## GPU smoke test
 
-單元測試通過後，只有 runtime、catalog 或 backend command 改動需要 GPU smoke test：
+After unit tests pass, only changes to runtime, the catalog, or backend commands require a GPU smoke test:
 
 ```bash
 vllm restart
@@ -112,4 +112,4 @@ curl http://127.0.0.1:11432/ready
 curl http://127.0.0.1:11432/v1/models
 ```
 
-再送出一個非串流與一個串流 completion，確認 HTTP 200、canonical model routing、stream 結束後 active request 回到 0。模型載入耗時和 VRAM 取決於硬體，不能把 GPU smoke test 當成一般單元測試的一部分。
+Then send one non-streaming and one streaming completion, confirming HTTP 200, canonical model routing, and that active requests return to 0 after the stream ends. Model load time and VRAM usage depend on the hardware, so do not treat a GPU smoke test as part of ordinary unit testing.
