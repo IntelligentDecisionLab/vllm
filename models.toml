@@ -24,9 +24,9 @@ enable_prefix_caching = true
 model_path = "Qwen/Qwen3.8-27B-FP8"
 context_length = 262144
 kv_cache_dtype = "fp8_e4m3"
-tensor_parallel_size = 2
+tensor_parallel_size = 4
 data_parallel_size = 1
-gpu_memory_utilization = 0.35
+gpu_memory_utilization = 0.20
 max_num_seqs = 64
 idle_seconds = 0.0
 reasoning_parser = "qwen3"
@@ -36,6 +36,16 @@ aliases = ["qwen3.8-27b-fp8"]
 attention_backend = "flashinfer"
 speculative_method = "mtp"
 num_speculative_tokens = 2
+
+# --- 2a. openjev 4B NLI (pooling/classify backend，AlexWortega/openjev qwen3.5-4b-nli-v2) ---
+# 注意：pooling backend 只提供 /v1/classify，無 chat/completions；
+# 不設 speculative_method（TOML 無法清除繼承值，見上方註解）
+["openjev-4b"]
+model_path = "/home/sam/local/models/openjev-4b-v2-text"
+gpu_memory_utilization = 0.15    # 9GB bf16 權重 + 小型 KV；與 27B/9B 共用 GPU 1
+device_ids = [1]
+aliases = ["openjev"]
+vllm_args = ["--convert", "classify"]
 
 # --- 2. 批次實驗專用 (9B 使用 GPU 1，與 27B 共用) ---
 ["qwen3.5-9b"]

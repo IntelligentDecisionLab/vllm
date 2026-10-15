@@ -2,6 +2,13 @@
 set -u
 set -o pipefail
 
+# Read a local plaintext key, never source executable shell configuration.
+ADMIN_KEY_FILE="${VLLM_ADMIN_KEY_FILE:-${XDG_CONFIG_HOME:-$HOME/.config}/vllm-gateway/admin.key}"
+if [ -z "${VLLM_ADMIN_API_KEY:-}" ] && [ -r "$ADMIN_KEY_FILE" ]; then
+    VLLM_ADMIN_API_KEY=$(<"$ADMIN_KEY_FILE")
+    export VLLM_ADMIN_API_KEY
+fi
+
 # vLLM multi-model gateway companion script.
 PROJECT_DIR="${VLLM_PROJECT_DIR:-$HOME/Projects/vllm}"
 CONFIG_FILE="${VLLM_CONFIG_FILE:-$PROJECT_DIR/models.toml}"
@@ -254,8 +261,13 @@ models() {
         echo "curl is required." >&2
         return 1
     }
-    curl --silent --show-error --fail --max-time 5 "$API_URL/admin/models"
+    [ -n "${VLLM_ADMIN_API_KEY:-}" ] || { echo "VLLM_ADMIN_API_KEY is required." >&2; return 1; }
+    printf 'Authorization: Bearer %s\n' "$VLLM_ADMIN_API_KEY" | \
+        curl --silent --show-error --fail --max-time 5 \
+        --header @- "$API_URL/admin/models"
+    local result=$?
     echo
+    return "$result"
 }
 
 load_model() {
@@ -268,9 +280,14 @@ load_model() {
         echo "curl is required." >&2
         return 1
     }
-    curl --silent --show-error --fail-with-body --max-time "$BACKEND_STARTUP_TIMEOUT" \
+    [ -n "${VLLM_ADMIN_API_KEY:-}" ] || { echo "VLLM_ADMIN_API_KEY is required." >&2; return 1; }
+    printf 'Authorization: Bearer %s\n' "$VLLM_ADMIN_API_KEY" | \
+        curl --silent --show-error --fail-with-body --max-time "$BACKEND_STARTUP_TIMEOUT" \
+        --header @- \
         --request POST "$API_URL/admin/models/$model/load"
+    local result=$?
     echo
+    return "$result"
 }
 
 unload_model() {
@@ -283,9 +300,14 @@ unload_model() {
         echo "curl is required." >&2
         return 1
     }
-    curl --silent --show-error --fail-with-body --max-time "$BACKEND_SHUTDOWN_TIMEOUT" \
+    [ -n "${VLLM_ADMIN_API_KEY:-}" ] || { echo "VLLM_ADMIN_API_KEY is required." >&2; return 1; }
+    printf 'Authorization: Bearer %s\n' "$VLLM_ADMIN_API_KEY" | \
+        curl --silent --show-error --fail-with-body --max-time "$BACKEND_SHUTDOWN_TIMEOUT" \
+        --header @- \
         --request POST "$API_URL/admin/models/$model/unload"
+    local result=$?
     echo
+    return "$result"
 }
 
 download() {

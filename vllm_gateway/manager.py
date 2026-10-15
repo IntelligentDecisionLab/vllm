@@ -10,13 +10,15 @@ import socket
 import sys
 import time
 from collections.abc import Iterable
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from enum import StrEnum
 from typing import Any
+from uuid import uuid4
 
 import httpx
 
 from .catalog import ModelCatalog, ModelSpec, resolve_model_path
+from .diagnostics import BackendDiagnostic, BackendOutput, BackendStartupError, diagnostic_from_exception
 
 LOGGER = logging.getLogger("vllm_gateway")
 
@@ -39,6 +41,15 @@ class BackendBusyError(RuntimeError):
 
 class PortUnavailable(RuntimeError):
     pass
+
+
+def diagnose_backend_error(exc: BaseException) -> BackendDiagnostic:
+    code = None
+    if isinstance(exc, CapacityError):
+        code = "backend_capacity_exceeded"
+    elif isinstance(exc, PortUnavailable):
+        code = "backend_port_unavailable"
+    return diagnostic_from_exception(exc, code=code)
 
 
 class PortAllocator:
@@ -110,6 +121,10 @@ class Backend:
     stop_task: asyncio.Task[None] | None = None
     error: str | None = None
     failed_at: float | None = None
+    diagnostic: BackendDiagnostic | None = None
+    diagnostic_id: str = field(default_factory=lambda: uuid4().hex)
+    output: BackendOutput = field(default_factory=BackendOutput)
+    output_task: asyncio.Task[None] | None = None
 
 
 class BackendLease:
@@ -416,19 +431,23 @@ class ModelManager:
                     continue
                 else:
                     if backend and backend.state is BackendState.FAILED and backend.active_requests > 0:
-                        raise RuntimeError(
+                        message = (
                             f"model {spec.name!r} backend failed while "
                             f"{backend.active_requests} request(s) are still releasing"
                         )
+                        if backend.diagnostic is not None:
+                            raise BackendStartupError(message, backend.diagnostic)
+                        raise RuntimeError(message)
                     if (
                         backend
                         and backend.state is BackendState.FAILED
                         and backend.failed_at is not None
                         and time.monotonic() - backend.failed_at < self.failure_cooldown
                     ):
-                        raise RuntimeError(
-                            f"model {spec.name!r} is in failure cooldown: {backend.error or 'startup failed'}"
-                        )
+                        message = f"model {spec.name!r} is in failure cooldown: {backend.error or 'startup failed'}"
+                        if backend.diagnostic is not None:
+                            raise BackendStartupError(message, backend.diagnostic)
+                        raise RuntimeError(message)
 
                     resident = [item for item in self._backends.values() if item.state in self._RESIDENT_STATES]
                     if len(resident) >= self.max_loaded_models:
@@ -461,6 +480,9 @@ class ModelManager:
                         backend.state = BackendState.LOADING
                         backend.error = None
                         backend.failed_at = None
+                        backend.diagnostic = None
+                        backend.diagnostic_id = uuid4().hex
+                        backend.output = BackendOutput()
                         backend.last_used = time.monotonic()
                         generation = backend.generation
                         backend.start_task = asyncio.create_task(
@@ -541,6 +563,7 @@ class ModelManager:
                 "active_requests": 0,
                 "last_used": None,
                 "error": None,
+                "diagnostic": None,
             }
         process = backend.process
         return {
@@ -551,6 +574,7 @@ class ModelManager:
             "active_requests": backend.active_requests,
             "last_used": backend.last_used,
             "error": backend.error,
+            "diagnostic": backend.diagnostic.as_dict() if backend.diagnostic else None,
         }
 
     async def send(
@@ -574,11 +598,27 @@ class ModelManager:
             await self._start_backend(backend)
         except BaseException as exc:
             await self._stop_backend(backend)
+            diagnostic = None
+            if not isinstance(exc, asyncio.CancelledError):
+                diagnostic = diagnostic_from_exception(
+                    exc,
+                    code=backend.output.code or diagnose_backend_error(exc).code,
+                    diagnostic_id=backend.diagnostic_id,
+                )
+                LOGGER.error(
+                    "backend failure model=%s generation=%d diagnostic_id=%s code=%s: %s",
+                    backend.spec.name,
+                    generation,
+                    diagnostic.diagnostic_id,
+                    diagnostic.code,
+                    exc,
+                )
             async with self._lock:
                 if backend.generation == generation:
                     backend.start_task = None
                     backend.process = None
                     backend.error = None if isinstance(exc, asyncio.CancelledError) else str(exc)
+                    backend.diagnostic = diagnostic
                     backend.failed_at = None if isinstance(exc, asyncio.CancelledError) else time.monotonic()
                     backend.state = (
                         BackendState.STOPPED
@@ -587,6 +627,8 @@ class ModelManager:
                     )
                     self._ports.release(backend.spec.name, backend.port)
                     self._changed.notify_all()
+            if diagnostic is not None:
+                raise BackendStartupError(str(exc), diagnostic) from exc
             raise
 
         should_stop = False
@@ -623,7 +665,10 @@ class ModelManager:
         generation: int,
         process: asyncio.subprocess.Process,
     ) -> None:
-        returncode = await process.wait()
+        returncode = await self._wait_for_exit(process)
+        if backend.generation != generation or backend.process is not process:
+            return
+        await self._finish_output(backend, process)
         async with self._lock:
             if backend.generation != generation or backend.process is not process:
                 return
@@ -633,6 +678,19 @@ class ModelManager:
             if backend.state not in {BackendState.DRAINING, BackendState.STOPPED}:
                 backend.state = BackendState.FAILED
                 backend.error = f"vLLM backend exited with code {returncode}"
+                backend.diagnostic = diagnostic_from_exception(
+                    RuntimeError(backend.error),
+                    code=backend.output.code or "backend_exited",
+                    diagnostic_id=backend.diagnostic_id,
+                )
+                LOGGER.error(
+                    "backend failure model=%s generation=%d diagnostic_id=%s code=%s: %s",
+                    backend.spec.name,
+                    generation,
+                    backend.diagnostic.diagnostic_id,
+                    backend.diagnostic.code,
+                    backend.error,
+                )
                 backend.failed_at = time.monotonic()
             self._changed.notify_all()
 
@@ -644,6 +702,9 @@ class ModelManager:
         command = self._command(backend.spec, model_path, backend.port)
         LOGGER.info("starting vLLM backend for %s: %s", backend.spec.name, " ".join(command))
         env = os.environ.copy()
+        # Backends never need the management API credential; do not leak it into
+        # vLLM subprocess environments (e.g. crash dumps or in-process plugins).
+        env.pop("VLLM_ADMIN_API_KEY", None)
         cuda_home = os.getenv("CUDA_HOME", "/usr/local/cuda")
         if os.path.isdir(cuda_home):
             env["CUDA_HOME"] = cuda_home
@@ -656,10 +717,16 @@ class ModelManager:
             *command,
             env=env,
             stdin=asyncio.subprocess.DEVNULL,
-            stdout=None,
-            stderr=None,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.STDOUT,
             start_new_session=True,
         )
+        reader = getattr(backend.process, "stdout", None)
+        if reader is not None:
+            backend.output_task = asyncio.create_task(
+                self._read_output(reader, backend.output, backend.spec.name, backend.generation),
+                name=f"vllm-output-{backend.spec.name}-{backend.generation}",
+            )
 
         deadline = time.monotonic() + self.startup_timeout
         last_error = "backend did not become ready"
@@ -830,23 +897,78 @@ class ModelManager:
                     self._ports.release(backend.spec.name, backend.port)
                 self._changed.notify_all()
 
+    @staticmethod
+    async def _read_output(
+        reader: asyncio.StreamReader,
+        output: BackendOutput,
+        name: str,
+        generation: int,
+    ) -> None:
+        try:
+            while chunk := await reader.read(4096):
+                output.feed(chunk)
+                LOGGER.info(
+                    "backend output model=%s generation=%d: %s",
+                    name,
+                    generation,
+                    chunk.decode("utf-8", errors="replace"),
+                )
+        except (OSError, ValueError) as exc:
+            LOGGER.warning("backend output reader failed for %s: %s", name, exc)
+
+    @staticmethod
+    async def _wait_for_exit(process: asyncio.subprocess.Process) -> int:
+        # Process.wait() can wait for inherited pipes even after the child exits.
+        waiter = asyncio.create_task(process.wait())
+        try:
+            while process.returncode is None:
+                done, _ = await asyncio.wait({waiter}, timeout=0.1)
+                if done:
+                    return waiter.result()
+            return process.returncode
+        finally:
+            if not waiter.done():
+                waiter.cancel()
+            await asyncio.gather(waiter, return_exceptions=True)
+
+    @staticmethod
+    async def _finish_output(backend: Backend, process: asyncio.subprocess.Process | None) -> None:
+        task = backend.output_task
+        if task is None:
+            return
+        done, _ = await asyncio.wait({task}, timeout=0.5)
+        if not done:
+            task.cancel()
+            # StreamReader has no public close API. Close only our own pipe's
+            # transport when a descendant keeps stdout open past the deadline.
+            reader = getattr(process, "stdout", None)
+            transport = getattr(reader, "_transport", None)
+            if transport is not None:
+                transport.close()
+        await asyncio.gather(task, return_exceptions=True)
+        if backend.output_task is task:
+            backend.output_task = None
+
     async def _stop_backend(self, backend: Backend) -> None:
         process = backend.process
-        if not process or process.returncode is not None:
-            return
-        LOGGER.info("stopping vLLM backend for %s", backend.spec.name)
         try:
-            os.killpg(process.pid, signal.SIGTERM)
-        except ProcessLookupError:
-            return
-        try:
-            await asyncio.wait_for(process.wait(), timeout=self.shutdown_timeout)
-        except TimeoutError:
+            if not process or process.returncode is not None:
+                return
+            LOGGER.info("stopping vLLM backend for %s", backend.spec.name)
             try:
-                os.killpg(process.pid, signal.SIGKILL)
+                os.killpg(process.pid, signal.SIGTERM)
             except ProcessLookupError:
-                pass
-            await process.wait()
+                return
+            try:
+                await asyncio.wait_for(self._wait_for_exit(process), timeout=self.shutdown_timeout)
+            except TimeoutError:
+                try:
+                    os.killpg(process.pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+                await asyncio.wait_for(self._wait_for_exit(process), timeout=self.shutdown_timeout)
+        finally:
+            await self._finish_output(backend, process)
 
     def _idle_threshold(self, spec: ModelSpec) -> float:
         if self.idle_seconds > 0:

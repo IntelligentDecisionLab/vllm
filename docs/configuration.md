@@ -77,6 +77,7 @@ The gateway source directly supports the main `VLLM_*` settings, including:
 VLLM_CONFIG_FILE
 VLLM_DEFAULT_MODEL
 VLLM_SERVICE_HOST / VLLM_SERVICE_PORT
+VLLM_ADMIN_API_KEY
 VLLM_BACKEND_PORT / VLLM_BACKEND_PORT_COUNT
 VLLM_MAX_LOADED_MODELS
 VLLM_TP_SIZE / VLLM_DP_SIZE
@@ -90,7 +91,7 @@ VLLM_MODEL_IDLE_SECONDS
 VLLM_SERVICE_LOG_LEVEL
 ```
 
-The deployment companion script supports additional lifecycle variables such as preload, PID/log paths, and stop timeout. The script is in `scripts/vllm` in the repository and is installed to `~/.local/bin/vllm` for deployment.
+The deployment companion script supports additional lifecycle variables such as preload, PID/log paths, and stop timeout. The script is in `scripts/vllm` in the repository and is installed to `~/.local/bin/vllm` for deployment. It also supports `VLLM_ADMIN_KEY_FILE` for specifying a local key file; by default, it looks for `vllm-gateway/admin.key` under `XDG_CONFIG_HOME` (`~/.config` when unset). The gateway Python code does not read this file itself.
 
 ## File placement
 
@@ -101,16 +102,21 @@ The deployment companion script supports additional lifecycle variables such as 
 | Architecture and development guidelines | `docs/`, each level's `AGENTS.md` | people and coding agents |
 | Model weights and Hugging Face cache | local model path or Hugging Face cache outside the repository | vLLM, huggingface-hub |
 | Gateway PID/log | `~/.cache/vllm-gateway.pid`, `~/.cache/vllm-gateway.log` by default | companion script |
+| Management API key | `~/.config/vllm-gateway/admin.key` or `VLLM_ADMIN_KEY_FILE`; not version-controlled | companion script; directory 700, file 600 |
 | Python/test/build artifacts | `.venv/`, `__pycache__/`, `.pytest_cache/`, `build/`, `dist/`, `*.egg-info` | development tools; do not commit |
 | Agent harness state | `.agents/`, `.pi/` | agent tooling; excluded by `.gitignore` |
 
 ## Secrets
 
-The repository does not implement its own API key or secret-file loader. Hugging Face tokens, proxy credentials, and other deployment secrets should be provided through the process environment, the Hugging Face credential store, or an external secret manager. Do not put tokens in `models.toml`, README, docs, test fixtures, or log examples.
+Management endpoints require `VLLM_ADMIN_API_KEY` (it must be set to a non-empty value before startup) and remain restricted to loopback sources; the gateway refuses to start when it is unset. Calls to `GET /admin/models`, `POST /admin/reload`, `POST /admin/models/{model}/load`, and `POST /admin/models/{model}/unload` must include `Authorization: Bearer <key>`; the `models`, `load`, and `unload` commands in `scripts/vllm` use the same environment variable. `/health`, `/ready`, `/v1/*`, and other proxy routes do not require this key; the Authorization header on inference requests is forwarded to the backend as usual. Changing the key requires restarting the gateway; catalog reload does not update the key.
+
+For convenient local operation, `scripts/vllm` prefers a non-empty `VLLM_ADMIN_API_KEY`; when it is unset, it reads the local key file and exports it to the gateway. The file contains only a single-line key, may have a trailing newline, must not contain `export` or an assignment, and the script does not execute its contents. Restrict the directory to 700 and the file to 600; updating or reinstalling the script does not modify this file, so `vllm models`, `vllm load`, and `vllm restart` can be used without repeatedly exporting the key manually. When running `python -m vllm_gateway` directly, you must still provide the environment variable yourself.
+
+Use a sufficiently long random value and pass it through a local key file with restricted permissions, the process environment, or an external secret manager. Avoid putting the key in CLI arguments, `models.toml`, README, docs, test fixtures, or log examples. A bearer key does not protect against users on the same host who can read the gateway process environment or memory of a process with the same UID; connections across hosts must not rely only on loopback checks and require TLS, a reverse proxy, and network isolation. Deployment secrets such as Hugging Face tokens and proxy credentials must likewise not be committed.
 
 ## Safe update workflow
 
 1. After editing the catalog, first run the catalog and command-generation tests.
-2. Call `POST /admin/reload`; first inspect the `added`, `removed`, `updated`, and `kept_loaded` fields in the response.
+2. Use the management key to call `POST /admin/reload` (for example, `printf 'Authorization: Bearer %s\n' "$VLLM_ADMIN_API_KEY" | curl --header @- -X POST http://127.0.0.1:11432/admin/reload`); first inspect the `added`, `removed`, `updated`, and `kept_loaded` fields in the response.
 3. Check `/health` and `/v1/models`. If weights need to be loaded, then run a GPU smoke test for the target model.
 4. When reload fails, do not restart to mask the parser problem; the service retains the old catalog, so first correct the configuration error indicated by the response and log.

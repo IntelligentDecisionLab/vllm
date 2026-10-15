@@ -2,11 +2,14 @@ from __future__ import annotations
 
 import asyncio
 import socket
+import sys
 from pathlib import Path
 
+import httpx
 import pytest
 
 from vllm_gateway.catalog import ModelCatalog, ModelSpec
+from vllm_gateway.diagnostics import BackendOutput, BackendStartupError
 from vllm_gateway.manager import (
     Backend,
     BackendBusyError,
@@ -248,8 +251,10 @@ async def test_process_crash_marks_failed_and_can_restart(monkeypatch: pytest.Mo
     assert "code 17" in status["error"]
     assert manager._ports._by_model["model-a"] == old_port
 
-    with pytest.raises(RuntimeError, match="still releasing"):
+    with pytest.raises(BackendStartupError, match="still releasing") as still_releasing:
         await manager.acquire("model-a")
+    assert still_releasing.value.diagnostic is lease.backend.diagnostic
+    assert still_releasing.value.diagnostic.diagnostic_id == status["diagnostic"]["diagnostic_id"]
     other = await manager.acquire("model-b")
     assert other.backend.port != old_port
     await other.release()
@@ -352,6 +357,32 @@ def test_command_defaults_to_single_gpu_when_parallelism_is_unspecified() -> Non
     manager = ModelManager(ModelCatalog([spec], Path("models.toml")))
     command = manager._command(spec, "org/a", 30000)
     assert command[command.index("--tensor-parallel-size") + 1] == "1"
+
+
+async def test_backend_env_strips_admin_api_key(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Backend subprocesses must not inherit the management API credential."""
+    monkeypatch.setenv("VLLM_ADMIN_API_KEY", "secret-admin-key")
+    monkeypatch.setenv("VLLM_GW_TEST_KEEPME", "keep")
+    spec = ModelSpec(name="model-a", model_path="org/a")
+    manager = ModelManager(ModelCatalog([spec], Path("models.toml")))
+
+    captured: dict[str, object] = {}
+
+    async def fake_exec(*args: object, **kwargs: object) -> FakeProcess:
+        captured["env"] = kwargs.get("env")
+        process = FakeProcess()
+        process.finish(1)
+        return process
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_exec)
+    backend = Backend(spec, 30999)
+    with pytest.raises(RuntimeError, match="exited with code 1"):
+        await manager._start_backend(backend)
+
+    env = captured["env"]
+    assert isinstance(env, dict)
+    assert "VLLM_ADMIN_API_KEY" not in env
+    assert env.get("VLLM_GW_TEST_KEEPME") == "keep"
 
 
 async def test_reload_keeps_loaded_model_and_adds_new(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -487,3 +518,173 @@ def test_new_managed_flags_reject_all_spellings(flag: str, spelling: str) -> Non
         manager._command(spec, spec.model_path, 30000)
     with pytest.raises(ValueError, match="gateway-managed"):
         ModelManager(catalog, vllm_args=(argument,))
+
+
+async def test_startup_diagnostic_drains_exit_tail_and_reuses_cooldown_id(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    manager = ModelManager(make_catalog(), failure_cooldown=60)
+    outputs = iter([b"ValueError: No available memory for the cache blocks\n", b"unknown error secret\n"])
+
+    async def fake_exec(*args: object, **kwargs: object) -> FakeProcess:
+        assert kwargs["stdout"] == asyncio.subprocess.PIPE
+        assert kwargs["stderr"] == asyncio.subprocess.STDOUT
+        process = FakeProcess()
+        process.stdout = asyncio.StreamReader()  # type: ignore[attr-defined]
+        process.stdout.feed_data(next(outputs))  # type: ignore[attr-defined]
+        process.stdout.feed_eof()  # type: ignore[attr-defined]
+        process.finish(1)
+        return process
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_exec)
+    with pytest.raises(BackendStartupError) as first:
+        await manager.acquire("model-a")
+    diagnostic = first.value.diagnostic
+    assert diagnostic.code == "kv_cache_memory_insufficient"
+    with pytest.raises(BackendStartupError) as cooldown:
+        await manager.acquire("a")
+    assert cooldown.value.diagnostic is diagnostic
+    status = await manager.backend_status("model-a")
+    assert status["diagnostic"] == diagnostic.as_dict()
+    backend = manager._backends["model-a"]
+    assert backend.output_task is None
+    assert "model-a" not in manager._ports._by_model
+
+    manager.failure_cooldown = 0
+    with pytest.raises(BackendStartupError) as restart:
+        await manager.acquire("a")
+    assert restart.value.diagnostic.code == "backend_startup_failed"
+    assert restart.value.diagnostic.diagnostic_id != diagnostic.diagnostic_id
+    await manager.shutdown()
+
+
+async def test_timeout_and_parallel_backend_diagnostics_are_isolated(monkeypatch: pytest.MonkeyPatch) -> None:
+    manager = ModelManager(make_catalog(), startup_timeout=0, max_loaded_models=2)
+
+    async def fake_start(backend: Backend) -> None:
+        if backend.spec.name == "model-a":
+            backend.output.feed(b"CUDA out of memory")
+            raise RuntimeError("exited code 1 secret")
+        raise TimeoutError("secret URL")
+
+    monkeypatch.setattr(manager, "_start_backend", fake_start)
+    results = await asyncio.gather(manager.acquire("a"), manager.acquire("b"), return_exceptions=True)
+    assert all(isinstance(result, BackendStartupError) for result in results)
+    statuses = [await manager.backend_status(name) for name in ("a", "b")]
+    assert statuses[0]["diagnostic"]["code"] == "cuda_out_of_memory"
+    assert statuses[1]["diagnostic"]["code"] == "backend_startup_timeout"
+    assert statuses[0]["diagnostic"]["diagnostic_id"] != statuses[1]["diagnostic"]["diagnostic_id"]
+    await manager.shutdown()
+
+
+async def test_non_eof_output_cleanup_is_bounded_and_cancellation_keeps_no_diagnostic() -> None:
+    manager = ModelManager(make_catalog())
+    backend = Backend(manager.catalog.get("a"), 30999)
+    reader = asyncio.StreamReader()
+    task = asyncio.create_task(manager._read_output(reader, backend.output, "model-a", 1))
+    backend.output_task = task
+    await asyncio.wait_for(manager._stop_backend(backend), timeout=2)
+    assert task.done()
+    assert backend.output_task is None
+    assert backend.diagnostic is None
+    await manager.shutdown()
+
+
+async def test_successful_backend_continues_draining_large_stdout_and_stderr(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    manager = ModelManager(make_catalog(), shutdown_timeout=1)
+    script = (
+        "import sys,time; sys.stdout.write('x'*1000000); sys.stdout.flush(); "
+        "sys.stderr.write('END-OF-OUTPUT\\n'); sys.stderr.flush(); time.sleep(120)"
+    )
+    monkeypatch.setattr(manager, "_command", lambda *args: [sys.executable, "-c", script])
+    monkeypatch.setattr(PortAllocator, "_is_available", staticmethod(lambda port: True))
+
+    async def ready(url: str, **kwargs: object) -> httpx.Response:
+        return httpx.Response(200, json={"data": [{"id": "model-a"}]})
+
+    monkeypatch.setattr(manager._client, "get", ready)
+    seen = asyncio.Event()
+    backend_output_feed = manager._read_output
+
+    async def observe(reader: asyncio.StreamReader, output: BackendOutput, name: str, generation: int) -> None:
+        original_feed = output.feed
+
+        def feed(chunk: bytes) -> None:
+            original_feed(chunk)
+            if b"END-OF-OUTPUT" in output.tail:
+                seen.set()
+
+        output.feed = feed
+        await backend_output_feed(reader, output, name, generation)
+
+    monkeypatch.setattr(manager, "_read_output", observe)
+    lease = await manager.acquire("a")
+    try:
+        await asyncio.wait_for(seen.wait(), timeout=5)
+        assert lease.backend.state is BackendState.READY
+        assert len(lease.backend.output.tail) <= 65536
+        assert lease.backend.output_task is not None and not lease.backend.output_task.done()
+    finally:
+        await lease.release()
+        await manager.shutdown()
+    assert lease.backend.output_task is None
+
+
+async def test_cancelled_startup_finishes_reader_without_recording_failure(monkeypatch: pytest.MonkeyPatch) -> None:
+    manager = ModelManager(make_catalog(), shutdown_timeout=0.1)
+    entered = asyncio.Event()
+    process = FakeProcess()
+    process.stdout = asyncio.StreamReader()  # type: ignore[attr-defined]
+
+    async def spawn(*args: object, **kwargs: object) -> FakeProcess:
+        return process
+
+    async def blocked_health(*args: object, **kwargs: object) -> httpx.Response:
+        entered.set()
+        await asyncio.Event().wait()
+        raise AssertionError("unreachable")
+
+    def terminate(pid: int, sig: int) -> None:
+        assert pid == process.pid
+        process.finish()
+        process.stdout.feed_eof()  # type: ignore[attr-defined]
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", spawn)
+    monkeypatch.setattr(manager._client, "get", blocked_health)
+    monkeypatch.setattr("vllm_gateway.manager.os.killpg", terminate)
+    acquiring = asyncio.create_task(manager.acquire("a"))
+    await entered.wait()
+    assert await manager.unload("a")
+    with pytest.raises(RuntimeError, match="was cancelled"):
+        await acquiring
+    backend = manager._backends["model-a"]
+    assert backend.output_task is None
+    assert backend.diagnostic is None
+    assert backend.state is BackendState.STOPPED
+    await manager.shutdown()
+
+
+async def test_crash_with_inherited_pipe_does_not_block_watcher() -> None:
+    manager = ModelManager(make_catalog())
+
+    class PipeHoldingProcess(FakeProcess):
+        async def wait(self) -> int:
+            await asyncio.Event().wait()
+            raise AssertionError("pipe never closes")
+
+    process = PipeHoldingProcess()
+    process.returncode = 1
+    reader = asyncio.StreamReader()
+    process.stdout = reader  # type: ignore[attr-defined]
+    reader.feed_data(b"torch.OutOfMemoryError: private path\n")
+    backend = Backend(manager.catalog.get("a"), 30999, state=BackendState.READY, process=process)
+    manager._backends["model-a"] = backend
+    backend.output_task = asyncio.create_task(manager._read_output(reader, backend.output, "model-a", 0))
+    await asyncio.wait_for(manager._watch_process(backend, 0, process), timeout=2)
+    assert backend.state is BackendState.FAILED
+    assert backend.diagnostic is not None
+    assert backend.diagnostic.code == "cuda_out_of_memory"
+    assert backend.output_task is None
+    await manager.shutdown()

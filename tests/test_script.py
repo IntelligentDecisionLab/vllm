@@ -1,12 +1,16 @@
 from __future__ import annotations
 
+import json
 import os
 import socket
 import stat
 import subprocess
+import sys
 import textwrap
 import time
 from pathlib import Path
+
+import pytest
 
 SCRIPT = Path(__file__).parent.parent / "scripts" / "vllm"
 
@@ -48,7 +52,15 @@ def test_companion_script_lifecycle_and_management(tmp_path: Path) -> None:
                     self.end_headers()
                     self.wfile.write(body)
 
+                def _authorized(self):
+                    if self.headers.get("Authorization") != "Bearer test-script-key":
+                        self._write(401, {"error": "unauthorized"})
+                        return False
+                    return True
+
                 def do_GET(self):
+                    if self.path.startswith("/admin/") and not self._authorized():
+                        return
                     if self.path == "/health":
                         self._write(200, {"status": "ok", "loaded_models": ["model-a"]})
                     elif self.path == "/ready":
@@ -59,7 +71,13 @@ def test_companion_script_lifecycle_and_management(tmp_path: Path) -> None:
                         self._write(404, {"error": "not found"})
 
                 def do_POST(self):
-                    if self.path.endswith("/load") or self.path.endswith("/unload"):
+                    if self.path.startswith("/admin/") and not self._authorized():
+                        return
+                    if "/failed/" in self.path:
+                        self._write(503, {"error": {"code": "kv_cache_memory_insufficient",
+                                                  "message": "Not enough GPU memory to allocate KV cache blocks.",
+                                                  "diagnostic_id": "test-diagnostic-id"}})
+                    elif self.path.endswith("/load") or self.path.endswith("/unload"):
                         self._write(200, {"ok": True, "path": self.path})
                     else:
                         self._write(404, {"error": "not found"})
@@ -67,6 +85,7 @@ def test_companion_script_lifecycle_and_management(tmp_path: Path) -> None:
                 def log_message(self, *_):
                     pass
 
+            assert os.environ.get("VLLM_ADMIN_API_KEY") == "test-script-key"
             server = ThreadingHTTPServer(("127.0.0.1", int(os.environ["VLLM_SERVICE_PORT"])), Handler)
             signal.signal(signal.SIGTERM, lambda *_: os._exit(0))
             server.serve_forever()
@@ -93,6 +112,9 @@ def test_companion_script_lifecycle_and_management(tmp_path: Path) -> None:
         "VLLM_GATEWAY_START_TIMEOUT": "5",
         "VLLM_STOP_TIMEOUT": "5",
         "FAKE_SERVER": str(fake_server),
+        "VLLM_ADMIN_API_KEY": "test-script-key",
+        "XDG_CONFIG_HOME": str(tmp_path / "config"),
+        "VLLM_ADMIN_KEY_FILE": "",
     }
 
     def run(*args: str, check: bool = True) -> subprocess.CompletedProcess[str]:
@@ -117,10 +139,26 @@ def test_companion_script_lifecycle_and_management(tmp_path: Path) -> None:
         assert '"loaded_models": ["model-a"]' in models.stdout
         assert '"ok": true' in run("load", "model-a").stdout.lower()
         assert '"ok": true' in run("unload", "model-a").stdout.lower()
+        for operation in ("load", "unload"):
+            failed = run(operation, "failed", check=False)
+            assert failed.returncode == 22
+            assert "kv_cache_memory_insufficient" in failed.stdout
+            assert "test-diagnostic-id" in failed.stdout
+        env["VLLM_ADMIN_API_KEY"] = "wrong-key"
+        assert run("models", check=False).returncode == 22
+        env.pop("VLLM_ADMIN_API_KEY")
+        assert run("models", check=False).returncode == 1
+        assert run("load", "model-a", check=False).returncode == 1
+        assert run("unload", "model-a", check=False).returncode == 1
+        key_file = tmp_path / "config" / "vllm-gateway" / "admin.key"
+        key_file.parent.mkdir(parents=True)
+        key_file.write_text("test-script-key\n", encoding="utf-8")
+        key_file.chmod(0o600)
 
         restarted = run("restart")
         assert "vLLM gateway stopped" in restarted.stdout
         assert "Started vLLM gateway" in restarted.stdout
+        assert '"loaded_models": ["model-a"]' in run("models").stdout
     finally:
         run("stop", check=False)
 
@@ -176,3 +214,59 @@ def test_script_does_not_scan_or_kill_backend_processes() -> None:
     assert "fuser" not in content
     assert "pgrep" not in content
     assert "backend_pids" not in content
+
+
+@pytest.mark.parametrize(
+    "source,key", [("environment", "credential-secret"), ("default", "file-secret"), ("override", "override-secret")]
+)
+def test_management_curl_keeps_credentials_out_of_argv_and_preserves_exit_code(
+    tmp_path: Path,
+    source: str,
+    key: str,
+) -> None:
+    curl = tmp_path / "curl"
+    curl.write_text(
+        f"#!{sys.executable}\n"
+        "import json, os, sys\n"
+        "from pathlib import Path\n"
+        "Path(os.environ['CURL_CAPTURE']).write_text(json.dumps({'args': sys.argv[1:], 'stdin': sys.stdin.read()}))\n"
+        'print(\'{"error":{"code":"backend_startup_failed","diagnostic_id":"test-id"}}\')\n'
+        "sys.exit(22)\n",
+        encoding="utf-8",
+    )
+    curl.chmod(0o755)
+    capture = tmp_path / "capture.json"
+    config = tmp_path / "config"
+    key_file = config / "vllm-gateway" / "admin.key"
+    key_file.parent.mkdir(parents=True)
+    key_file.write_text("file-secret\n", encoding="utf-8")
+    key_file.chmod(0o600)
+    override = tmp_path / "override.key"
+    override.write_text("override-secret\n", encoding="utf-8")
+    override.chmod(0o600)
+    env = {
+        **os.environ,
+        "PATH": f"{tmp_path}:{os.environ['PATH']}",
+        "CURL_CAPTURE": str(capture),
+        "XDG_CONFIG_HOME": str(config),
+        "VLLM_ADMIN_KEY_FILE": "",
+    }
+    env.pop("VLLM_ADMIN_API_KEY", None)
+    if source == "environment":
+        env["VLLM_ADMIN_API_KEY"] = key
+    elif source == "override":
+        env["VLLM_ADMIN_KEY_FILE"] = str(override)
+    for operation in ("models", "load", "unload"):
+        result = subprocess.run(
+            [str(SCRIPT), operation, "model-a"],
+            env=env,
+            text=True,
+            capture_output=True,
+            timeout=10,
+        )
+        assert result.returncode == 22
+        assert "backend_startup_failed" in result.stdout
+        captured = json.loads(capture.read_text(encoding="utf-8"))
+        assert key not in " ".join(captured["args"])
+        assert key not in result.stdout + result.stderr
+        assert captured["stdin"] == f"Authorization: Bearer {key}\n"

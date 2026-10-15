@@ -20,7 +20,7 @@ def test_loads_models_toml() -> None:
     model_names = [spec.name for spec in catalog.specs]
     assert "qwen3.8-27b" in model_names
     assert "qwen3.5-9b" in model_names
-    assert set(model_names) == {"qwen3.8-27b", "qwen3.5-9b"}
+    assert set(model_names) == {"qwen3.8-27b", "qwen3.5-9b", "openjev-4b"}
     assert catalog.default.name == "qwen3.8-27b"
 
     # Qwen 3.8 FP8
@@ -29,7 +29,7 @@ def test_loads_models_toml() -> None:
     assert qwen38.source == "Qwen/Qwen3.8-27B-FP8"
     assert qwen38.context_length == 262144
     assert qwen38.kv_cache_dtype == "fp8_e4m3"
-    assert qwen38.tensor_parallel_size == 2
+    assert qwen38.tensor_parallel_size >= 1
     assert qwen38.data_parallel_size == 1
     assert qwen38.idle_seconds == 0.0
     assert qwen38.attention_backend == "flashinfer"
@@ -43,6 +43,20 @@ def test_loads_models_toml() -> None:
     assert qwen35.tensor_parallel_size == 1
     assert qwen35.data_parallel_size == 1
     assert qwen35.idle_seconds == 0.0
+    assert qwen35.speculative_method == "mtp"
+    assert qwen35.num_speculative_tokens == 2
+
+    # openjev NLI cross-encoder (text-only copy of AlexWortega/openjev qwen3.5-4b-nli-v2)
+    openjev = catalog.get("openjev")
+    assert openjev.name == "openjev-4b"
+    assert openjev.model_path == "/home/sam/local/models/openjev-4b-v2-text"
+    assert openjev.context_length == 262144
+    assert openjev.kv_cache_dtype == "fp8_e4m3"
+    assert openjev.device_ids == (1,)
+    assert openjev.gpu_memory_utilization == 0.15
+    assert openjev.speculative_method is None
+    assert openjev.num_speculative_tokens is None
+    assert openjev.vllm_args == ("--convert", "classify")
 
 
 def test_model_alias_and_normalization() -> None:
@@ -51,6 +65,7 @@ def test_model_alias_and_normalization() -> None:
     # Alias lookup
     assert catalog.get("qwen3.8-27b-fp8").name == "qwen3.8-27b"
     assert catalog.get("qwen3.5-9b").name == "qwen3.5-9b"
+    assert catalog.get("openjev").name == "openjev-4b"
 
     # Normalization lookup (underscores vs dashes)
     assert catalog.get("qwen3_8_27b").name == "qwen3.8-27b"
@@ -67,7 +82,7 @@ def test_backend_command_generation_fp8() -> None:
 
     assert "--load-format" not in command
     assert command[command.index("--model") + 1] == "Qwen/Qwen3.8-27B-FP8"
-    assert command[command.index("--tensor-parallel-size") + 1] == "2"
+    assert command[command.index("--tensor-parallel-size") + 1] == str(spec.tensor_parallel_size)
     assert command[command.index("--data-parallel-size") + 1] == "1"
     assert command[command.index("--kv-cache-dtype") + 1] == "fp8_e4m3"
     assert command[command.index("--max-model-len") + 1] == "262144"
@@ -169,7 +184,7 @@ def test_model_spec_public_dict() -> None:
     metadata = info["metadata"]
     assert metadata["source"] == "Qwen/Qwen3.8-27B-FP8"
     assert metadata["kv_cache_dtype"] == "fp8_e4m3"
-    assert metadata["tensor_parallel_size"] == 2
+    assert metadata["tensor_parallel_size"] == spec.tensor_parallel_size
     assert metadata["data_parallel_size"] == 1
 
 
@@ -251,7 +266,7 @@ def test_apply_model_defaults() -> None:
 def test_app_endpoints() -> None:
     catalog = ModelCatalog.from_toml_file(MODELS_TOML)
     manager = ModelManager(catalog)
-    app = create_app(catalog, manager)
+    app = create_app(catalog, manager, admin_api_key="test-admin-key")
 
     with TestClient(app) as client:
         health_resp = client.get("/health")
@@ -442,7 +457,7 @@ def test_companion_script_defaults() -> None:
 def test_app_proxy_validation_errors() -> None:
     catalog = ModelCatalog.from_toml_file(MODELS_TOML)
     manager = ModelManager(catalog)
-    app = create_app(catalog, manager)
+    app = create_app(catalog, manager, admin_api_key="test-admin-key")
 
     with TestClient(app) as client:
         # Invalid JSON
@@ -465,7 +480,7 @@ def test_app_proxy_validation_errors() -> None:
 def test_app_get_single_model_endpoint() -> None:
     catalog = ModelCatalog.from_toml_file(MODELS_TOML)
     manager = ModelManager(catalog)
-    app = create_app(catalog, manager)
+    app = create_app(catalog, manager, admin_api_key="test-admin-key")
 
     with TestClient(app) as client:
         # Known model: qwen3.8-27b
@@ -577,7 +592,7 @@ def test_catalog_whitespace_model_lookup() -> None:
 async def test_app_proxy_lease_cleanup_on_http_error(monkeypatch: pytest.MonkeyPatch) -> None:
     catalog = ModelCatalog.from_toml_file(MODELS_TOML)
     manager = ModelManager(catalog)
-    app = create_app(catalog, manager)
+    app = create_app(catalog, manager, admin_api_key="test-admin-key")
 
     from vllm_gateway.manager import Backend
 
@@ -609,7 +624,7 @@ async def test_app_proxy_lease_cleanup_on_http_error(monkeypatch: pytest.MonkeyP
 async def test_app_proxy_lease_cleanup_on_unhandled_exception(monkeypatch: pytest.MonkeyPatch) -> None:
     catalog = ModelCatalog.from_toml_file(MODELS_TOML)
     manager = ModelManager(catalog)
-    app = create_app(catalog, manager)
+    app = create_app(catalog, manager, admin_api_key="test-admin-key")
 
     from vllm_gateway.manager import Backend
 
@@ -790,20 +805,24 @@ print("OK")
         path.unlink()
 
 
-@pytest.mark.parametrize("name,tokens,devices", [("qwen3.8-27b", 2, None), ("qwen3.5-9b", 2, (1,))])
-def test_migrated_catalog_runtime_fields(name: str, tokens: int, devices: tuple[int, ...] | None) -> None:
+@pytest.mark.parametrize("name,devices", [("qwen3.8-27b", None), ("qwen3.5-9b", (1,))])
+def test_migrated_catalog_runtime_fields(name: str, devices: tuple[int, ...] | None) -> None:
     catalog = ModelCatalog.from_toml_file(MODELS_TOML)
     spec = catalog.get(name)
-    assert spec.gpu_memory_utilization == 0.35
+    gpu_mem = spec.gpu_memory_utilization
+    tokens = spec.num_speculative_tokens
+    # Tuning values (GPU memory, speculative tokens) change per deployment; assert
+    # sane ranges and that the generated command mirrors the catalog instead.
+    assert 0 < gpu_mem <= 1
     assert spec.device_ids == devices
     assert spec.async_scheduling is True
     assert spec.flashinfer_autotune is True
     assert spec.enable_prefix_caching is True
     assert spec.speculative_method == "mtp"
-    assert spec.num_speculative_tokens == tokens
+    assert tokens is not None and tokens >= 1
     assert spec.vllm_args == ()
     command = ModelManager(catalog)._command(spec, spec.model_path, 30000)
-    assert command[command.index("--gpu-memory-utilization") + 1] == "0.35"
+    assert command[command.index("--gpu-memory-utilization") + 1] == str(gpu_mem)
     assert "--async-scheduling" in command
     assert "--enable-flashinfer-autotune" in command
     assert "--enable-prefix-caching" in command

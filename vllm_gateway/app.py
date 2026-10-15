@@ -2,9 +2,11 @@ from __future__ import annotations
 
 import json
 import logging
+import secrets
 from collections.abc import AsyncIterator, Iterable
 from contextlib import asynccontextmanager
 from pathlib import Path
+from uuid import uuid4
 
 import httpx
 from fastapi import FastAPI, Request
@@ -16,6 +18,7 @@ from .manager import (
     CapacityError,
     ModelManager,
     PortUnavailable,
+    diagnose_backend_error,
 )
 
 LOGGER = logging.getLogger("vllm_gateway")
@@ -60,6 +63,47 @@ def _forward_headers(headers: httpx.Headers) -> dict[str, str]:
     }
 
 
+_PUBLIC_BACKEND_MESSAGE = "Model backend is unavailable; consult the management API with the diagnostic ID."
+
+
+def _backend_error(exc: BaseException, *, detailed: bool) -> JSONResponse:
+    diagnostic = diagnose_backend_error(exc)
+    LOGGER.error("backend unavailable diagnostic_id=%s code=%s", diagnostic.diagnostic_id, diagnostic.code)
+    return JSONResponse(
+        status_code=503,
+        content={
+            "error": {
+                "type": "backend_unavailable",
+                "code": diagnostic.code if detailed else "backend_unavailable",
+                "message": diagnostic.message if detailed else _PUBLIC_BACKEND_MESSAGE,
+                "diagnostic_id": diagnostic.diagnostic_id,
+            }
+        },
+    )
+
+
+def _model_status(status: dict[str, object], *, detailed: bool) -> dict[str, object]:
+    result = dict(status)
+    diagnostic = result.get("diagnostic")
+    if result.get("error"):
+        result["error"] = (
+            diagnostic["message"] if detailed and isinstance(diagnostic, dict) else _PUBLIC_BACKEND_MESSAGE
+        )
+    if not detailed:
+        result.pop("diagnostic", None)
+        if isinstance(diagnostic, dict):
+            result["diagnostic_id"] = diagnostic["diagnostic_id"]
+    return result
+
+
+def _health_status(status: dict[str, object], *, detailed: bool) -> dict[str, object]:
+    result = dict(status)
+    residents = result.get("resident_models")
+    if isinstance(residents, list):
+        result["resident_models"] = [_model_status(item, detailed=detailed) for item in residents]
+    return result
+
+
 def create_app(
     catalog: ModelCatalog,
     manager: ModelManager,
@@ -68,7 +112,10 @@ def create_app(
     default_model: str | None = None,
     pinned_default: bool = False,
     catalog_path: str | Path | None = None,
+    admin_api_key: str | None = None,
 ) -> FastAPI:
+    if not admin_api_key or not admin_api_key.strip():
+        raise ValueError("VLLM_ADMIN_API_KEY must be set to enable the management API")
     request_default = catalog.canonicalize(default_model)
     config_path = Path(catalog_path).expanduser().resolve() if catalog_path is not None else None
 
@@ -90,11 +137,11 @@ def create_app(
 
     @app.get("/health")
     async def health() -> dict[str, object]:
-        return await manager.health()
+        return _health_status(await manager.health(), detailed=False)
 
     @app.get("/ready")
     async def ready() -> JSONResponse:
-        status = await manager.health()
+        status = _health_status(await manager.health(), detailed=False)
         if not status["loaded_models"]:
             return JSONResponse(status_code=503, content={**status, "status": "not_ready"})
         return JSONResponse(content=status)
@@ -116,29 +163,37 @@ def create_app(
                 content={"error": {"message": str(exc), "type": "invalid_request_error"}},
             )
 
-    def require_local(request: Request) -> JSONResponse | None:
+    def require_admin(request: Request) -> JSONResponse | None:
         host = request.client.host if request.client else ""
         if host not in {"127.0.0.1", "::1", "testclient"}:
             return JSONResponse(
                 status_code=403,
                 content={"error": {"message": "management API is localhost-only", "type": "forbidden"}},
             )
+        authorization = request.headers.get("authorization", "")
+        scheme, _, token = authorization.partition(" ")
+        if scheme.lower() != "bearer" or not secrets.compare_digest(token, admin_api_key):
+            return JSONResponse(
+                status_code=401,
+                headers={"WWW-Authenticate": "Bearer"},
+                content={"error": {"message": "invalid management API key", "type": "unauthorized"}},
+            )
         return None
 
     @app.get("/admin/models")
     async def admin_models(request: Request) -> JSONResponse:
-        denied = require_local(request)
+        denied = require_admin(request)
         if denied:
             return denied
-        return JSONResponse(content=await manager.health())
+        return JSONResponse(content=_health_status(await manager.health(), detailed=True))
 
     @app.post("/admin/models/{model_id:path}/load")
     async def load_model(model_id: str, request: Request) -> JSONResponse:
-        denied = require_local(request)
+        denied = require_admin(request)
         if denied:
             return denied
         try:
-            return JSONResponse(content=await manager.load(model_id))
+            return JSONResponse(content=_model_status(await manager.load(model_id), detailed=True))
         except KeyError as exc:
             return JSONResponse(
                 status_code=404,
@@ -146,14 +201,11 @@ def create_app(
             )
         except (CapacityError, FileNotFoundError, PortUnavailable, RuntimeError, TimeoutError, ValueError) as exc:
             LOGGER.exception("failed to load model %s", model_id)
-            return JSONResponse(
-                status_code=503,
-                content={"error": {"message": str(exc), "type": "backend_unavailable"}},
-            )
+            return _backend_error(exc, detailed=True)
 
     @app.post("/admin/reload")
     async def reload_config(request: Request) -> JSONResponse:
-        denied = require_local(request)
+        denied = require_admin(request)
         if denied:
             return denied
         if config_path is None:
@@ -189,12 +241,12 @@ def create_app(
 
     @app.post("/admin/models/{model_id:path}/unload")
     async def unload_model(model_id: str, request: Request) -> JSONResponse:
-        denied = require_local(request)
+        denied = require_admin(request)
         if denied:
             return denied
         try:
             unloaded = await manager.unload(model_id)
-            status = await manager.backend_status(model_id)
+            status = _model_status(await manager.backend_status(model_id), detailed=True)
             return JSONResponse(content={"unloaded": unloaded, "model": status})
         except KeyError as exc:
             return JSONResponse(
@@ -209,6 +261,9 @@ def create_app(
 
     @app.api_route("/{path:path}", methods=PROXY_METHODS)
     async def proxy(path: str, request: Request) -> Response:
+        normalized_path = path.strip("/").lower()
+        if normalized_path == "admin" or normalized_path.startswith("admin/"):
+            return JSONResponse(status_code=404, content={"detail": "Not Found"})
         body = await request.body()
         outgoing_body = body
         model_name: str | None = None
@@ -254,10 +309,7 @@ def create_app(
             )
         except (CapacityError, FileNotFoundError, PortUnavailable, RuntimeError, TimeoutError, ValueError) as exc:
             LOGGER.exception("failed to start model %s", model_name)
-            return JSONResponse(
-                status_code=503,
-                content={"error": {"message": str(exc), "type": "backend_unavailable"}},
-            )
+            return _backend_error(exc, detailed=False)
 
         backend = lease.backend
         headers = {key: value for key, value in request.headers.items() if key.lower() not in HOP_BY_HOP_HEADERS}
@@ -286,10 +338,24 @@ def create_app(
                 )
             except httpx.HTTPError as exc:
                 await lease.release()
-                LOGGER.warning("proxy %s %s → vLLM HTTP error: %s", request.method, str(request.url), exc)
+                diagnostic_id = uuid4().hex
+                LOGGER.warning(
+                    "proxy %s %s → vLLM HTTP error diagnostic_id=%s: %s",
+                    request.method,
+                    str(request.url),
+                    diagnostic_id,
+                    exc,
+                )
                 return JSONResponse(
                     status_code=502,
-                    content={"error": {"message": f"vLLM backend request failed: {exc}", "type": "bad_gateway"}},
+                    content={
+                        "error": {
+                            "message": "The backend request failed; consult the gateway log with the diagnostic ID.",
+                            "type": "bad_gateway",
+                            "code": "backend_request_failed",
+                            "diagnostic_id": diagnostic_id,
+                        }
+                    },
                 )
 
             response_headers = _forward_headers(upstream.headers)

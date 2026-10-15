@@ -100,6 +100,37 @@ install -m 755 scripts/vllm ~/.local/bin/vllm
 
 After modifying the script, run `uv run --extra test python -m pytest -q tests/test_script.py` to verify lifecycle and process ownership behavior.
 
+## Investigate backend failures through the management-side cause and diagnostic ID
+
+The management endpoint `/admin/models/{model}/load` still returns HTTP 503 when backend loading fails, and the JSON `error` adds `code`, a safe `message`, and `diagnostic_id`. `vllm load <model>` preserves the JSON body and returns curl's non-zero exit status (usually 22 for an HTTP error), which can be used for shell automation.
+
+| `error.code` | Meaning |
+| --- | --- |
+| `kv_cache_memory_insufficient` | Unable to allocate KV cache blocks |
+| `cuda_out_of_memory` | Explicit CUDA/PyTorch OOM |
+| `backend_startup_timeout` | Readiness was not reached before the startup deadline |
+| `backend_startup_failed` | Unrecognized startup failure; no cause is inferred |
+| `backend_exited` | A started backend exited unexpectedly |
+| `backend_capacity_exceeded` | Backend slots are in use or loading |
+| `backend_port_unavailable` | No backend port is available |
+| `model_files_unavailable` | Required model files are unavailable |
+| `invalid_backend_configuration` | The backend configuration is invalid |
+
+`resident_models[].diagnostic` in `/admin/models` retains the last failure reason for that generation. The same ID is reused during the retry cooldown, and a new generation receives a new ID; this is not a permanent history database. A gateway startup failure from the public inference API returns only a `backend_unavailable` summary and ID; `/health` and `/ready` likewise do not include detailed classification. HTTP transport errors from the gateway to the upstream still return 502, using `backend_request_failed` and a separate ID; HTTP bodies/SSE responses from the backend itself are not rewritten.
+
+The merged stdout/stderr of every backend is continuously written to the gateway log, with a tail of at most 64 KiB retained in memory; failure summaries do not expose the original traceback, paths, or credentials. After receiving an ID, locate the failure record and inspect nearby output by model/generation:
+
+```bash
+grep -F '<diagnostic_id>' "${VLLM_LOG_FILE:-$HOME/.cache/vllm-gateway.log}"
+```
+
+The new code takes effect only after restarting the gateway. The companion script must also be reinstalled (a restart unloads resident models, so check for active requests first):
+
+```bash
+install -m 755 scripts/vllm ~/.local/bin/vllm
+vllm restart
+```
+
 ## GPU smoke test
 
 After unit tests pass, only changes to runtime, the catalog, or backend commands require a GPU smoke test:
