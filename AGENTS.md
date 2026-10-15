@@ -58,3 +58,5 @@ uv build
 ```
 
 Repository 已配置 Ruff lint、format 與 pytest gate；type-check gate 仍未配置。只有 runtime、catalog 或 backend command 變更需要另做 GPU smoke test；命令與驗收項目見 [`docs/development.md`](docs/development.md#gpu-smoke-test)。
+
+手動重現 backend command 除錯時（直接跑 vLLM，不經 gateway），環境必須有 `CUDA_HOME=/usr/local/cuda` 且 `PATH` 含 `/usr/local/cuda/bin`：本機 `/usr/bin/nvcc` 是 CUDA 12.0，flashinfer JIT 偵測 CUDA arch 時會對 SM 12.x GPU 誤報 `SM 12.x requires CUDA >= 12.9`，表徵為 `FlashInfer requires GPUs with sm75 or higher`——錯誤訊息指向 GPU 架構，真正的問題是偵測到舊版 nvcc。Gateway 自建的 backend subprocess 不受影響（`manager.py` 已設定 `CUDA_HOME` 與 PATH）。
