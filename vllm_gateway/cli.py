@@ -9,6 +9,7 @@ import uvicorn
 
 from .app import create_app
 from .catalog import ModelCatalog, default_hub_cache
+from .downloads import DownloadManager
 from .manager import ModelManager
 from .memory import query_gpu_memory
 
@@ -98,7 +99,7 @@ def main(argv: list[str] | None = None) -> None:
         shutdown_timeout=args.backend_shutdown_timeout,
     )
     uvicorn.run(
-        create_app(catalog, manager),
+        create_app(catalog, manager, DownloadManager(args.hub_cache)),
         host=args.host,
         port=args.port,
         log_level=args.log_level,

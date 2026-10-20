@@ -1,6 +1,9 @@
 from __future__ import annotations
 
 import json
+import struct
+import time
+from pathlib import Path
 from typing import Any
 
 import httpx
@@ -10,6 +13,7 @@ from fastapi.testclient import TestClient
 from vllm_gateway.app import create_app
 from vllm_gateway.catalog import ModelCatalog, ModelSpec
 from vllm_gateway.diagnostics import BackendStartupError, diagnostic_from_exception
+from vllm_gateway.downloads import DownloadJob, DownloadManager, DownloadState
 from vllm_gateway.manager import Backend, BackendBusyError, BackendLease, BackendState
 
 
@@ -100,6 +104,16 @@ class FakeManager:
     async def load(self, name: str | None) -> dict[str, Any]:
         return await self.backend_status(name)
 
+    async def validate_fits(self, spec: ModelSpec) -> None:
+        if spec.weights_bytes > 90 * 1024**3:
+            raise ValueError(f"{spec.name!r} needs more memory than the GPU has")
+
+    async def forget(self, name: str | None) -> None:
+        spec = self.catalog.get(name)
+        if spec.name in self.busy:
+            raise BackendBusyError(f"model {spec.name!r} has active requests")
+        self.backends.pop(spec.name, None)
+
     async def unload(self, name: str | None) -> bool:
         spec = self.catalog.get(name)
         if spec.name in self.busy:
@@ -108,7 +122,18 @@ class FakeManager:
 
     async def backend_status(self, name: str | None) -> dict[str, Any]:
         spec = self.catalog.get(name)
-        backend = self.backends[spec.name]
+        backend = self.backends.get(spec.name)
+        if backend is None:
+            return {
+                "name": spec.name,
+                "state": "stopped",
+                "port": None,
+                "pid": None,
+                "active_requests": 0,
+                "last_used": None,
+                "error": None,
+                "diagnostic": None,
+            }
         return {
             "name": spec.name,
             "state": backend.state.value,
@@ -117,18 +142,53 @@ class FakeManager:
             "active_requests": backend.active_requests,
             "last_used": backend.last_used,
             "error": None,
+            "diagnostic": None,
         }
 
 
-def make_app() -> tuple[TestClient, FakeManager]:
+def write_safetensors(path: Path, payload: int) -> None:
+    header = json.dumps({"w": {"dtype": "F16", "shape": [1], "data_offsets": [0, 0]}}).encode()
+    with open(path, "wb") as f:
+        f.write(struct.pack("<Q", len(header)) + header)
+        f.truncate(8 + len(header) + payload)  # sparse, so large sizes cost nothing
+
+
+def make_cached_model(hub: Path, repo_id: str, payload: int = 1000) -> None:
+    repo = hub / f"models--{repo_id.replace('/', '--')}"
+    snapshot = repo / "snapshots" / "rev1"
+    snapshot.mkdir(parents=True)
+    (repo / "refs").mkdir()
+    (repo / "refs" / "main").write_text("rev1")
+    config = {
+        "architectures": ["Qwen3ForCausalLM"],
+        "model_type": "qwen3",
+        "num_hidden_layers": 28,
+        "num_attention_heads": 16,
+        "num_key_value_heads": 8,
+        "head_dim": 128,
+        "hidden_size": 1024,
+        "max_position_embeddings": 40960,
+    }
+    (snapshot / "config.json").write_text(json.dumps(config))
+    write_safetensors(snapshot / "model.safetensors", payload)
+
+
+def make_app(
+    *,
+    hub_cache: Path | None = None,
+    state_file: Path | None = None,
+    downloads: DownloadManager | None = None,
+) -> tuple[TestClient, FakeManager]:
     catalog = ModelCatalog(
         [
             ModelSpec(name="model-a", model_path="/m/a", repo_id="org/a", context_length=4096),
             ModelSpec(name="model-b", model_path="/m/b", repo_id="org/b", context_length=8192),
-        ]
+        ],
+        hub_cache=hub_cache,
+        state_file=state_file,
     )
     manager = FakeManager(catalog)
-    app = create_app(catalog, manager)  # type: ignore[arg-type]
+    app = create_app(catalog, manager, downloads)  # type: ignore[arg-type]
     return TestClient(app), manager
 
 
@@ -182,34 +242,150 @@ def test_models_endpoint_marks_multiple_models_loaded() -> None:
     assert ready.status_code == 200
 
 
-def test_unknown_admin_routes_do_not_proxy() -> None:
-    client, manager = make_app()
-    with TestClient(client.app) as public:
-        assert public.get("/health").status_code == 200
-        assert public.get("/ready").status_code == 200
-        assert public.get("/v1/models").status_code == 200
-        assert public.post("/v1/chat/completions", json={"model": "model-a", "messages": []}).status_code == 200
-        for path in ("/admin/not-an-operation", "/Admin/models", "http://testserver//admin/models"):
-            assert public.post(path).status_code == 404
-    assert [path for _, path, _ in manager.sent] == ["v1/chat/completions"]
-
-
-def test_local_management_load_and_unload() -> None:
+def test_reserved_prefixes_are_never_proxied() -> None:
     client, manager = make_app()
     with client:
-        listed = client.get("/admin/models")
-        loaded = client.post("/admin/models/model-a/load")
-        unloaded = client.post("/admin/models/model-a/unload")
-        manager.busy.add("model-b")
-        busy = client.post("/admin/models/model-b/unload")
+        for method, path in (
+            ("POST", "/models/unknown"),
+            ("PUT", "/models/local"),
+            ("GET", "/Models/anything"),
+            ("PATCH", "/aliases/model-a"),
+            ("POST", "/aliases"),
+        ):
+            response = client.request(method, path, json={"model": "model-a"})
+            assert response.status_code in {404, 405, 400, 422, 201}, (method, path)
+        assert client.post("/models/unknown", json={"model": "model-a"}).status_code == 404
+        assert client.get("/health").status_code == 200
+        assert client.get("/v1/models").status_code == 200
+    assert manager.sent == []
 
-    assert listed.status_code == 200
+
+def test_alias_load_and_unload() -> None:
+    client, manager = make_app()
+    with client:
+        listed = client.get("/aliases")
+        loaded = client.post("/aliases/model-a/load")
+        unloaded = client.post("/aliases/model-a/unload")
+        manager.busy.add("model-b")
+        busy = client.post("/aliases/model-b/unload")
+        missing = client.post("/aliases/nope/load")
+
+    assert [item["alias"] for item in listed.json()["data"]] == ["model-a", "model-b"]
     assert loaded.status_code == 200
-    assert loaded.json()["name"] == "model-a"
+    assert loaded.json()["alias"] == "model-a"
+    assert loaded.json()["repo_id"] == "org/a"
+    assert loaded.json()["context_length"] == 4096
     assert unloaded.status_code == 200
     assert unloaded.json()["unloaded"] is True
     assert busy.status_code == 409
     assert busy.json()["error"]["type"] == "model_busy"
+    assert missing.status_code == 404
+
+
+def test_delete_alias_removes_it_from_routing() -> None:
+    client, manager = make_app()
+    with client:
+        manager.busy.add("model-b")
+        busy = client.delete("/aliases/model-b")
+        deleted = client.delete("/aliases/model-a")
+        again = client.delete("/aliases/model-a")
+        routed = client.post("/v1/chat/completions", json={"model": "model-a"})
+
+    assert busy.status_code == 409
+    assert deleted.status_code == 200 and deleted.json() == {"deleted": "model-a"}
+    assert again.status_code == 404
+    assert routed.status_code == 404
+    assert [spec.name for spec in client.app.state.catalog.specs] == ["model-b"]
+
+
+def test_create_alias_from_the_local_cache(tmp_path: Path) -> None:
+    hub = tmp_path / "hub"
+    make_cached_model(hub, "Qwen/Qwen3-0.6B")
+    client, _ = make_app(hub_cache=hub, state_file=tmp_path / "aliases.json")
+    with client:
+        created = client.post("/aliases", json={"alias": "mine", "model": "Qwen/Qwen3-0.6B", "context_length": 8192})
+        duplicate = client.post("/aliases", json={"alias": "mine", "model": "Qwen/Qwen3-0.6B", "context_length": 8192})
+        too_long = client.post("/aliases", json={"alias": "long", "model": "Qwen/Qwen3-0.6B", "context_length": 999999})
+        missing = client.post("/aliases", json={"alias": "x", "model": "org/absent", "context_length": 4096})
+        bad_alias = client.post("/aliases", json={"alias": ["x"], "model": "Qwen/Qwen3-0.6B", "context_length": 4096})
+        not_object = client.post("/aliases", json=[1])
+        listed = client.get("/aliases").json()["data"]
+
+    assert created.status_code == 201
+    assert created.json()["alias"] == "mine"
+    assert created.json()["context_length"] == 8192
+    assert created.json()["state"] == "stopped"
+    assert duplicate.status_code == 400 and "already exists" in duplicate.json()["error"]["message"]
+    assert too_long.status_code == 400
+    assert missing.status_code == 404
+    assert bad_alias.status_code == 400
+    assert not_object.status_code == 400
+    assert "mine" in [item["alias"] for item in listed]
+    assert json.loads((tmp_path / "aliases.json").read_text())["aliases"]["mine"]["context_length"] == 8192
+
+
+def test_create_alias_rejects_a_model_that_cannot_fit_the_gpu(tmp_path: Path) -> None:
+    hub = tmp_path / "hub"
+    make_cached_model(hub, "org/huge", payload=95 * 1024**3)
+    client, _ = make_app(hub_cache=hub, state_file=tmp_path / "aliases.json")
+    with client:
+        response = client.post("/aliases", json={"alias": "huge", "model": "org/huge", "context_length": 4096})
+
+    assert response.status_code == 400
+    assert "more memory than the GPU has" in response.json()["error"]["message"]
+    assert "huge" not in [spec.name for spec in client.app.state.catalog.specs]
+
+
+def test_local_models_lists_loadable_repos_and_their_aliases(tmp_path: Path) -> None:
+    hub = tmp_path / "hub"
+    make_cached_model(hub, "Qwen/Qwen3-0.6B")
+    make_cached_model(hub, "org/downloading")
+    catalog = ModelCatalog(
+        [ModelSpec(name="mine", model_path="/m", repo_id="Qwen/Qwen3-0.6B", context_length=4096)],
+        hub_cache=hub,
+    )
+    manager = FakeManager(catalog)
+    downloads = DownloadManager(hub, remote_files=lambda *_: [("w.safetensors", 1)], fetch=lambda *_: None)
+    downloads._jobs["j"] = DownloadJob("j", "org/downloading", None, 1, DownloadState.RUNNING)
+    with TestClient(create_app(catalog, manager, downloads)) as client:  # type: ignore[arg-type]
+        data = client.get("/models/local").json()["data"]
+
+    assert [item["repo_id"] for item in data] == ["Qwen/Qwen3-0.6B"]
+    assert data[0]["aliases"] == ["mine"]
+    assert data[0]["max_context"] == 40960
+    assert data[0]["reasoning_parser"] == "qwen3"
+
+
+def test_download_endpoints(tmp_path: Path) -> None:
+    fetched: list[str] = []
+    downloads = DownloadManager(
+        tmp_path,
+        remote_files=lambda repo, rev: [("model.safetensors", 1000), ("config.json", 10), ("junk.bin", 10**12)],
+        fetch=lambda repo, rev, cache, patterns: fetched.append(repo),
+        disk_free=lambda path: 10**9 + 20 * 1024**3,
+    )
+    client, _ = make_app(downloads=downloads)
+    with client:
+        started = client.post("/models/download", json={"repo_id": "Qwen/Qwen3-0.6B"})
+        job_id = started.json()["id"]
+        for _ in range(50):
+            job = client.get(f"/models/downloads/{job_id}").json()
+            if job["state"] == "succeeded":
+                break
+            time.sleep(0.02)
+        listed = client.get("/models/downloads").json()["data"]
+        missing = client.get("/models/downloads/nope")
+        bad = client.post("/models/download", json={"repo_id": "not a repo"})
+        no_body = client.post("/models/download", content=b"x")
+
+    assert started.status_code == 202
+    assert job["state"] == "succeeded"
+    assert job["size_bytes"] == 1010
+    assert fetched == ["Qwen/Qwen3-0.6B"]
+    assert [item["id"] for item in listed] == [job_id]
+    assert missing.status_code == 404
+    assert bad.status_code == 400
+    assert no_body.status_code == 400
 
 
 def test_load_and_proxy_share_diagnostic(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -222,7 +398,7 @@ def test_load_and_proxy_share_diagnostic(monkeypatch: pytest.MonkeyPatch) -> Non
     monkeypatch.setattr(manager, "load", failed)
     monkeypatch.setattr(manager, "acquire", failed)
     with client:
-        admin = client.post("/admin/models/model-a/load")
+        admin = client.post("/aliases/model-a/load")
         public = client.post("/v1/chat/completions", json={"model": "model-a", "messages": []})
     assert admin.status_code == public.status_code == 503
     assert admin.json()["error"] == {"type": "backend_unavailable", **diagnostic.as_dict()}
@@ -244,7 +420,7 @@ def test_generic_startup_errors_never_echo_internal_text(
     monkeypatch.setattr(manager, "load", failed)
     monkeypatch.setattr(manager, "acquire", failed)
     with client:
-        for path, body in (("/admin/models/model-a/load", None), ("/v1/chat/completions", {"model": "model-a"})):
+        for path, body in (("/aliases/model-a/load", None), ("/v1/chat/completions", {"model": "model-a"})):
             response = client.post(path, json=body)
             assert response.status_code == 503
             assert len(response.json()["error"]["diagnostic_id"]) == 32

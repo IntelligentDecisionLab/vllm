@@ -740,3 +740,21 @@ async def test_unloading_a_loading_model_releases_the_gate(monkeypatch: pytest.M
     lease = await asyncio.wait_for(manager.acquire("model-b"), timeout=2)
     await lease.release()
     await manager.shutdown()
+
+
+async def test_forget_stops_an_idle_backend_and_refuses_a_busy_one(monkeypatch: pytest.MonkeyPatch) -> None:
+    manager = ModelManager(make_catalog(), shutdown_timeout=0.1)
+    install_fake_processes(monkeypatch, manager)
+    busy = await manager.acquire("model-a")
+    idle = await manager.acquire("model-b")
+    await idle.release()
+
+    with pytest.raises(BackendBusyError):
+        await manager.forget("model-a")
+    await manager.forget("model-b")
+
+    assert "model-b" not in manager._backends
+    assert manager._backends["model-a"].state is BackendState.READY
+    await manager.forget("model-b")  # nothing resident any more: a no-op
+    await busy.release()
+    await manager.shutdown()

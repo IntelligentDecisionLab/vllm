@@ -306,12 +306,24 @@ class ModelCatalog:
             )
         return _spec_from_info(alias, info, context_length)
 
-    def add(self, alias: str, repo_id: str, context_length: object) -> ModelSpec:
+    def build(self, alias: str, repo_id: str, context_length: object) -> ModelSpec:
+        """Validate a new alias and resolve it against the cache without registering it."""
+
+        if not isinstance(alias, str) or not ALIAS_PATTERN.fullmatch(alias):
+            raise ValueError("alias must match [A-Za-z0-9._-]{1,64}")
         if alias in self._specs or alias in self._unresolved:
             raise ValueError(f"alias {alias!r} already exists")
-        spec = self._resolve(alias, repo_id, context_length)
-        self._specs[alias] = spec
+        return self._resolve(alias, repo_id, context_length)
+
+    def insert(self, spec: ModelSpec) -> None:
+        if spec.name in self._specs or spec.name in self._unresolved:
+            raise ValueError(f"alias {spec.name!r} already exists")
+        self._specs[spec.name] = spec
         self._save()
+
+    def add(self, alias: str, repo_id: str, context_length: object) -> ModelSpec:
+        spec = self.build(alias, repo_id, context_length)
+        self.insert(spec)
         return spec
 
     def remove(self, alias: str) -> ModelSpec:

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 from collections.abc import AsyncIterator
@@ -10,7 +11,8 @@ import httpx
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse, Response, StreamingResponse
 
-from .catalog import ModelCatalog
+from .catalog import ModelCatalog, scan_local_models
+from .downloads import DownloadError, DownloadManager
 from .manager import (
     BackendBusyError,
     CapacityError,
@@ -38,10 +40,16 @@ HOP_BY_HOP_HEADERS = {
     "host",
 }
 PROXY_METHODS = ["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"]
+# First path segments owned by the gateway. They are never proxied to a backend.
+RESERVED_PREFIXES = {"models", "aliases"}
+
+
+def _error(status_code: int, message: str, error_type: str) -> JSONResponse:
+    return JSONResponse(status_code=status_code, content={"error": {"message": message, "type": error_type}})
 
 
 def _invalid_request(message: str) -> JSONResponse:
-    return JSONResponse(status_code=400, content={"error": {"message": message, "type": "invalid_request_error"}})
+    return _error(400, message, "invalid_request_error")
 
 
 def _forward_headers(headers: httpx.Headers) -> dict[str, str]:
@@ -68,13 +76,15 @@ def _backend_error(exc: BaseException) -> JSONResponse:
     )
 
 
-def create_app(catalog: ModelCatalog, manager: ModelManager) -> FastAPI:
+def create_app(catalog: ModelCatalog, manager: ModelManager, downloads: DownloadManager | None = None) -> FastAPI:
     @asynccontextmanager
     async def lifespan(_: FastAPI):
         try:
             await manager.start()
             yield
         finally:
+            if downloads is not None:
+                await downloads.shutdown()
             await manager.shutdown()
 
     app = FastAPI(
@@ -113,44 +123,124 @@ def create_app(catalog: ModelCatalog, manager: ModelManager) -> FastAPI:
                 content={"error": {"message": str(exc), "type": "invalid_request_error"}},
             )
 
-    @app.get("/admin/models")
-    async def admin_models() -> JSONResponse:
-        return JSONResponse(content=await manager.health())
+    async def alias_view(name: str) -> dict[str, object]:
+        spec = app.state.catalog.get(name)
+        status = await manager.backend_status(name)
+        return {
+            "alias": spec.name,
+            "repo_id": spec.repo_id,
+            "context_length": spec.context_length,
+            "state": status["state"],
+            "port": status["port"],
+            "active_requests": status["active_requests"],
+            "last_used": status["last_used"],
+            "error": status["error"],
+            "diagnostic": status["diagnostic"],
+        }
 
-    @app.post("/admin/models/{model_id:path}/load")
-    async def load_model(model_id: str) -> JSONResponse:
+    @app.get("/models/local")
+    async def local_models() -> JSONResponse:
+        hub_cache = app.state.catalog.hub_cache
+        if hub_cache is None:
+            return JSONResponse(content={"object": "list", "data": []})
+        infos = await asyncio.to_thread(scan_local_models, hub_cache)
+        downloading = downloads.active_repos() if downloads is not None else set()
+        data = []
+        for info in infos:
+            if info.repo_id in downloading:
+                continue
+            aliases = [spec.name for spec in app.state.catalog.specs if spec.repo_id == info.repo_id]
+            data.append({**info.as_dict(), "aliases": aliases})
+        return JSONResponse(content={"object": "list", "data": data})
+
+    @app.post("/models/download")
+    async def start_download(request: Request) -> JSONResponse:
+        if downloads is None:
+            return _error(501, "downloads are not enabled", "not_implemented")
         try:
-            return JSONResponse(content=await manager.load(model_id))
+            body = await request.json()
+        except ValueError:
+            return _invalid_request("body must be JSON")
+        if not isinstance(body, dict):
+            return _invalid_request("body must be a JSON object")
+        try:
+            job = await downloads.submit(body.get("repo_id"), body.get("revision"))
+        except DownloadError as exc:
+            return _error(exc.status_code, exc.message, "download_error")
+        return JSONResponse(status_code=202, content=job.as_dict())
+
+    @app.get("/models/downloads")
+    async def list_downloads() -> JSONResponse:
+        jobs = downloads.jobs() if downloads is not None else []
+        return JSONResponse(content={"object": "list", "data": [job.as_dict() for job in jobs]})
+
+    @app.get("/models/downloads/{job_id}")
+    async def get_download(job_id: str) -> JSONResponse:
+        try:
+            if downloads is None:
+                raise KeyError(f"unknown download job {job_id!r}")
+            return JSONResponse(content=downloads.get(job_id).as_dict())
         except KeyError as exc:
-            return JSONResponse(
-                status_code=404,
-                content={"error": {"message": str(exc), "type": "invalid_request_error"}},
-            )
+            return _error(404, str(exc), "invalid_request_error")
+
+    @app.get("/aliases")
+    async def list_aliases() -> JSONResponse:
+        data = [await alias_view(spec.name) for spec in app.state.catalog.specs]
+        return JSONResponse(content={"object": "list", "data": data})
+
+    @app.post("/aliases", status_code=201)
+    async def create_alias(request: Request) -> JSONResponse:
+        try:
+            body = await request.json()
+        except ValueError:
+            return _invalid_request("body must be JSON")
+        if not isinstance(body, dict):
+            return _invalid_request("body must be a JSON object")
+        try:
+            spec = app.state.catalog.build(body.get("alias"), body.get("model"), body.get("context_length"))
+            await manager.validate_fits(spec)
+            app.state.catalog.insert(spec)
+        except KeyError as exc:
+            return _error(404, str(exc), "invalid_request_error")
+        except ValueError as exc:
+            return _invalid_request(str(exc))
+        return JSONResponse(status_code=201, content=await alias_view(spec.name))
+
+    @app.delete("/aliases/{alias}")
+    async def delete_alias(alias: str) -> JSONResponse:
+        try:
+            await manager.forget(alias)
+        except KeyError as exc:
+            return _error(404, str(exc), "invalid_request_error")
+        except BackendBusyError as exc:
+            return _error(409, str(exc), "model_busy")
+        app.state.catalog.remove(alias)
+        return JSONResponse(content={"deleted": alias})
+
+    @app.post("/aliases/{alias}/load")
+    async def load_alias(alias: str) -> JSONResponse:
+        try:
+            await manager.load(alias)
+            return JSONResponse(content=await alias_view(alias))
+        except KeyError as exc:
+            return _error(404, str(exc), "invalid_request_error")
         except (CapacityError, FileNotFoundError, PortUnavailable, RuntimeError, TimeoutError, ValueError) as exc:
-            LOGGER.exception("failed to load model %s", model_id)
+            LOGGER.exception("failed to load model %s", alias)
             return _backend_error(exc)
 
-    @app.post("/admin/models/{model_id:path}/unload")
-    async def unload_model(model_id: str) -> JSONResponse:
+    @app.post("/aliases/{alias}/unload")
+    async def unload_alias(alias: str) -> JSONResponse:
         try:
-            unloaded = await manager.unload(model_id)
-            status = await manager.backend_status(model_id)
-            return JSONResponse(content={"unloaded": unloaded, "model": status})
+            unloaded = await manager.unload(alias)
+            return JSONResponse(content={"unloaded": unloaded, "alias": await alias_view(alias)})
         except KeyError as exc:
-            return JSONResponse(
-                status_code=404,
-                content={"error": {"message": str(exc), "type": "invalid_request_error"}},
-            )
+            return _error(404, str(exc), "invalid_request_error")
         except BackendBusyError as exc:
-            return JSONResponse(
-                status_code=409,
-                content={"error": {"message": str(exc), "type": "model_busy"}},
-            )
+            return _error(409, str(exc), "model_busy")
 
     @app.api_route("/{path:path}", methods=PROXY_METHODS)
     async def proxy(path: str, request: Request) -> Response:
-        normalized_path = path.strip("/").lower()
-        if normalized_path == "admin" or normalized_path.startswith("admin/"):
+        if path.strip("/").split("/", 1)[0].lower() in RESERVED_PREFIXES:
             return JSONResponse(status_code=404, content={"detail": "Not Found"})
         body = await request.body()
         outgoing_body = body

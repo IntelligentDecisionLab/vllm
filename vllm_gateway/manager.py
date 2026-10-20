@@ -293,6 +293,22 @@ class ModelManager:
             await asyncio.shield(stop_task)
         return True
 
+    async def forget(self, model_name: str | None) -> None:
+        """Stop a model's backend and drop its bookkeeping. Raises BackendBusyError while it has active requests."""
+
+        spec = self.catalog.get(model_name)
+        await self.unload(spec.name)
+        async with self._lock:
+            backend = self._backends.get(spec.name)
+            if (
+                backend
+                and backend.state in {BackendState.STOPPED, BackendState.FAILED}
+                and backend.active_requests == 0
+                and backend.process is None
+            ):
+                del self._backends[spec.name]
+                self._ports.release(spec.name, backend.port)
+
     async def acquire(self, model_name: str | None) -> BackendLease:
         spec = self.catalog.get(model_name)
         while True:
