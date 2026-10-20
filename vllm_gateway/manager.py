@@ -9,6 +9,7 @@ import signal
 import socket
 import sys
 import time
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from enum import StrEnum
 from typing import Any
@@ -18,6 +19,7 @@ import httpx
 
 from .catalog import ModelCatalog, ModelSpec
 from .diagnostics import BackendDiagnostic, BackendOutput, BackendStartupError, diagnostic_from_exception
+from .memory import GIB, MemoryPlan, plan_memory
 
 LOGGER = logging.getLogger("vllm_gateway")
 
@@ -38,7 +40,14 @@ class BackendState(StrEnum):
 
 
 class CapacityError(RuntimeError):
-    pass
+    """Not enough free GPU memory, even after evicting every idle backend."""
+
+    def __init__(self, needed_bytes: int, free_bytes: int):
+        super().__init__(
+            f"insufficient GPU memory: {needed_bytes / GIB:.1f} GiB needed, {free_bytes / GIB:.1f} GiB free"
+        )
+        self.needed_bytes = needed_bytes
+        self.free_bytes = free_bytes
 
 
 class BackendBusyError(RuntimeError):
@@ -51,11 +60,13 @@ class PortUnavailable(RuntimeError):
 
 def diagnose_backend_error(exc: BaseException) -> BackendDiagnostic:
     code = None
+    message = None
     if isinstance(exc, CapacityError):
-        code = "backend_capacity_exceeded"
+        code = "insufficient_gpu_memory"
+        message = str(exc)
     elif isinstance(exc, PortUnavailable):
         code = "backend_port_unavailable"
-    return diagnostic_from_exception(exc, code=code)
+    return diagnostic_from_exception(exc, code=code, message=message)
 
 
 class PortAllocator:
@@ -131,6 +142,7 @@ class Backend:
     diagnostic_id: str = field(default_factory=lambda: uuid4().hex)
     output: BackendOutput = field(default_factory=BackendOutput)
     output_task: asyncio.Task[None] | None = None
+    memory: MemoryPlan | None = None
 
 
 class BackendLease:
@@ -166,19 +178,18 @@ class ModelManager:
         *,
         backend_port: int = 30000,
         backend_port_count: int = 64,
-        max_loaded_models: int = 2,
+        gpu_memory: Callable[[], tuple[int, int]] | None = None,
         startup_timeout: float = 900.0,
         shutdown_timeout: float = 30.0,
         idle_seconds: float = IDLE_SECONDS,
         failure_cooldown: float = 2.0,
+        settle_seconds: float = 1.0,
     ):
-        if max_loaded_models < 1:
-            raise ValueError("max_loaded_models must be at least 1")
-
         self.catalog = catalog
         self.backend_port = backend_port
         self.backend_port_count = backend_port_count
-        self.max_loaded_models = max_loaded_models
+        self._gpu_memory = gpu_memory
+        self.settle_seconds = settle_seconds
         self.startup_timeout = startup_timeout
         self.shutdown_timeout = shutdown_timeout
         self.idle_seconds = idle_seconds
@@ -186,6 +197,8 @@ class ModelManager:
 
         self._lock = asyncio.Lock()
         self._changed = asyncio.Condition(self._lock)
+        # Held from admission until the backend is READY or has failed, so only one model loads at a time.
+        self._startup_gate = asyncio.Lock()
         self._backends: dict[str, Backend] = {}
         self._ports = PortAllocator(backend_port, backend_port_count)
         self._stopping = False
@@ -284,7 +297,6 @@ class ModelManager:
         spec = self.catalog.get(model_name)
         while True:
             startup_task: asyncio.Task[None] | None = None
-            eviction_task: asyncio.Task[None] | None = None
             async with self._lock:
                 if self._stopping:
                     raise RuntimeError("model manager is shutting down")
@@ -331,55 +343,10 @@ class ModelManager:
                             raise BackendStartupError(message, backend.diagnostic)
                         raise RuntimeError(message)
 
-                    resident = [item for item in self._backends.values() if item.state in self._RESIDENT_STATES]
-                    if len(resident) >= self.max_loaded_models:
-                        candidates = [
-                            item for item in resident if item.state is BackendState.READY and item.active_requests == 0
-                        ]
-                        if candidates:
-                            victim = min(candidates, key=lambda item: item.last_used)
-                            victim.state = BackendState.DRAINING
-                            if not victim.stop_task or victim.stop_task.done():
-                                victim.stop_task = asyncio.create_task(
-                                    self._drain_and_stop(victim, victim.generation, self.shutdown_timeout),
-                                    name=f"vllm-evict-{victim.spec.name}",
-                                )
-                            eviction_task = victim.stop_task
-                            self._changed.notify_all()
-                        elif any(item.state is BackendState.DRAINING for item in resident):
-                            await self._changed.wait()
-                            continue
-                        else:
-                            raise CapacityError(f"all {self.max_loaded_models} backend slot(s) are active or loading")
-                    else:
-                        port = self._ports.reserve(spec.name)
-                        if backend is None:
-                            backend = Backend(spec=spec, port=port)
-                            self._backends[spec.name] = backend
-                        else:
-                            backend.spec = spec
-                            backend.port = port
-                        backend.generation += 1
-                        backend.state = BackendState.LOADING
-                        backend.error = None
-                        backend.failed_at = None
-                        backend.diagnostic = None
-                        backend.diagnostic_id = uuid4().hex
-                        backend.output = BackendOutput()
-                        backend.last_used = time.monotonic()
-                        generation = backend.generation
-                        backend.start_task = asyncio.create_task(
-                            self._start_generation(backend, generation),
-                            name=f"vllm-start-{spec.name}",
-                        )
-                        startup_task = backend.start_task
-                        self._changed.notify_all()
-
-            if eviction_task is not None:
-                await asyncio.shield(eviction_task)
-                continue
             if startup_task is None:
-                continue
+                startup_task = await self._admit_and_start(spec)
+                if startup_task is None:
+                    continue
             try:
                 await asyncio.shield(startup_task)
             except asyncio.CancelledError:
@@ -387,6 +354,111 @@ class ModelManager:
                 if current is not None and current.cancelling():
                     raise
                 raise RuntimeError(f"loading model {spec.name!r} was cancelled") from None
+
+    async def _admit_and_start(self, spec: ModelSpec) -> asyncio.Task[None] | None:
+        """Make room for `spec` and start it. Returns None when the state changed while queued."""
+
+        await self._startup_gate.acquire()
+        handed_off = False
+        try:
+            async with self._lock:
+                while True:
+                    if self._stopping:
+                        raise RuntimeError("model manager is shutting down")
+                    if not any(item.state is BackendState.DRAINING for item in self._backends.values()):
+                        break
+                    await self._changed.wait()
+                backend = self._backends.get(spec.name)
+                if backend and backend.state in self._RESIDENT_STATES:
+                    return None
+
+            memory = await self._make_room(spec) if self._gpu_memory is not None else None
+
+            async with self._lock:
+                if self._stopping:
+                    raise RuntimeError("model manager is shutting down")
+                backend = self._backends.get(spec.name)
+                if backend and backend.state in self._RESIDENT_STATES:
+                    return None
+                port = self._ports.reserve(spec.name)
+                if backend is None:
+                    backend = Backend(spec=spec, port=port)
+                    self._backends[spec.name] = backend
+                else:
+                    backend.spec = spec
+                    backend.port = port
+                backend.generation += 1
+                backend.state = BackendState.LOADING
+                backend.error = None
+                backend.failed_at = None
+                backend.diagnostic = None
+                backend.diagnostic_id = uuid4().hex
+                backend.output = BackendOutput()
+                backend.memory = memory
+                backend.last_used = time.monotonic()
+                generation = backend.generation
+                backend.start_task = asyncio.create_task(
+                    self._start_generation(backend, generation),
+                    name=f"vllm-start-{spec.name}",
+                )
+                backend.start_task.add_done_callback(self._release_startup_gate)
+                handed_off = True
+                self._changed.notify_all()
+                return backend.start_task
+        finally:
+            if not handed_off:
+                self._release_startup_gate()
+
+    def _release_startup_gate(self, _: object = None) -> None:
+        if self._startup_gate.locked():
+            self._startup_gate.release()
+
+    async def _measure_gpu(self) -> tuple[int, int]:
+        assert self._gpu_memory is not None
+        return await asyncio.to_thread(self._gpu_memory)
+
+    async def _make_room(self, spec: ModelSpec) -> MemoryPlan:
+        """Evict idle backends, least recently used first, until `spec` fits in free GPU memory."""
+
+        free, total = await self._measure_gpu()
+        plan = plan_memory(spec, total)
+        while free < plan.required_free_bytes:
+            stop_task: asyncio.Task[None] | None = None
+            async with self._lock:
+                idle = [
+                    item
+                    for item in self._backends.values()
+                    if item.state is BackendState.READY and item.active_requests == 0
+                ]
+                if idle:
+                    victim = min(idle, key=lambda item: item.last_used)
+                    victim.state = BackendState.DRAINING
+                    if not victim.stop_task or victim.stop_task.done():
+                        victim.stop_task = asyncio.create_task(
+                            self._drain_and_stop(victim, victim.generation, self.shutdown_timeout),
+                            name=f"vllm-evict-{victim.spec.name}",
+                        )
+                    stop_task = victim.stop_task
+                    self._changed.notify_all()
+            if stop_task is None:
+                raise CapacityError(plan.required_free_bytes, free)
+            await asyncio.shield(stop_task)
+            await asyncio.sleep(self.settle_seconds)
+            free, total = await self._measure_gpu()
+        return plan
+
+    async def validate_fits(self, spec: ModelSpec) -> None:
+        """Reject a spec that could never fit on this GPU, even when it is empty."""
+
+        if self._gpu_memory is None:
+            return
+        _, total = await self._measure_gpu()
+        plan = plan_memory(spec, total)
+        if plan.required_free_bytes > total:
+            raise ValueError(
+                f"{spec.name!r} needs about {plan.required_free_bytes / GIB:.1f} GiB "
+                f"but the GPU has {total / GIB:.1f} GiB; use a smaller context_length or model"
+            )
 
     async def release(self, backend: Backend | None) -> None:
         if backend is None:
@@ -415,6 +487,13 @@ class ModelManager:
             backend_snapshots = {name: self._backend_dict(backend, name) for name, backend in self._backends.items()}
             resident_count = sum(backend.state in self._RESIDENT_STATES for backend in self._backends.values())
             stopping = self._stopping
+        gpu = None
+        if self._gpu_memory is not None:
+            try:
+                free, total = await self._measure_gpu()
+                gpu = {"free_bytes": free, "total_bytes": total}
+            except Exception:
+                LOGGER.warning("cannot read GPU memory", exc_info=True)
         details = [
             backend_snapshots.get(spec.name) or self._backend_dict(None, spec.name) for spec in self.catalog.specs
         ]
@@ -426,10 +505,7 @@ class ModelManager:
             "active_requests": active_requests,
             "models": [spec.name for spec in self.catalog.specs],
             "resident_models": details,
-            "capacity": {
-                "max_loaded_models": self.max_loaded_models,
-                "resident_count": resident_count,
-            },
+            "capacity": {"resident_count": resident_count, "gpu": gpu},
             "stopping": stopping,
         }
 
@@ -581,7 +657,7 @@ class ModelManager:
 
         if not await asyncio.to_thread(os.path.isdir, backend.spec.model_path):
             raise FileNotFoundError(f"model files for {backend.spec.name!r} do not exist: {backend.spec.model_path}")
-        command = self._command(backend.spec, backend.port)
+        command = self._command(backend.spec, backend.port, backend.memory)
         LOGGER.info("starting vLLM backend for %s: %s", backend.spec.name, " ".join(command))
         env = os.environ.copy()
         cuda_home = os.getenv("CUDA_HOME", "/usr/local/cuda")
@@ -653,7 +729,7 @@ class ModelManager:
             f"timed out after {self.startup_timeout:.0f}s waiting for vLLM backend {backend.spec.name!r} ({last_error})"
         )
 
-    def _command(self, spec: ModelSpec, port: int) -> list[str]:
+    def _command(self, spec: ModelSpec, port: int, memory: MemoryPlan | None = None) -> list[str]:
         command = [
             sys.executable,
             "-m",
@@ -680,6 +756,15 @@ class ModelManager:
             "--enable-flashinfer-autotune",
             "--enable-prefix-caching",
         ]
+        if memory is not None:
+            command.extend(
+                (
+                    "--kv-cache-memory-bytes",
+                    str(memory.kv_cache_bytes),
+                    "--gpu-memory-utilization",
+                    str(memory.gpu_memory_utilization),
+                )
+            )
         if spec.reasoning_parser:
             command.extend(("--reasoning-parser", spec.reasoning_parser))
         if spec.tool_call_parser:

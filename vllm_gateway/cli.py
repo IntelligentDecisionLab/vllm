@@ -10,6 +10,7 @@ import uvicorn
 from .app import create_app
 from .catalog import ModelCatalog, default_hub_cache
 from .manager import ModelManager
+from .memory import query_gpu_memory
 
 
 def _env_int(key: str, default: int | None = None) -> int | None:
@@ -92,6 +93,7 @@ def main(argv: list[str] | None = None) -> None:
         catalog,
         backend_port=args.backend_port,
         backend_port_count=args.backend_port_count,
+        gpu_memory=query_gpu_memory,
         startup_timeout=args.startup_timeout,
         shutdown_timeout=args.backend_shutdown_timeout,
     )

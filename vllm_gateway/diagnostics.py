@@ -10,7 +10,7 @@ _MESSAGES = {
     "backend_startup_timeout": "The backend did not become ready before the startup deadline.",
     "backend_startup_failed": "The backend failed to start; consult the gateway log with the diagnostic ID.",
     "backend_exited": "The backend process exited unexpectedly.",
-    "backend_capacity_exceeded": "All backend slots are active or loading.",
+    "insufficient_gpu_memory": "Not enough free GPU memory to load the model.",
     "backend_port_unavailable": "No backend port is available.",
     "model_files_unavailable": "Required model files are unavailable.",
     "invalid_backend_configuration": "The backend configuration is invalid.",
@@ -58,6 +58,7 @@ def diagnostic_from_exception(
     *,
     code: str | None = None,
     diagnostic_id: str | None = None,
+    message: str | None = None,
 ) -> BackendDiagnostic:
     if isinstance(exc, BackendStartupError):
         return exc.diagnostic
@@ -70,4 +71,4 @@ def diagnostic_from_exception(
             code = "invalid_backend_configuration"
         else:
             code = "backend_startup_failed"
-    return BackendDiagnostic(code, _MESSAGES[code], diagnostic_id or uuid4().hex)
+    return BackendDiagnostic(code, message or _MESSAGES[code], diagnostic_id or uuid4().hex)

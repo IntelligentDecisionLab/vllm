@@ -20,7 +20,9 @@ from vllm_gateway.manager import (
     ModelManager,
     PortAllocator,
     PortUnavailable,
+    diagnose_backend_error,
 )
+from vllm_gateway.memory import GIB, plan_memory
 
 pytestmark = pytest.mark.anyio
 
@@ -81,7 +83,7 @@ def install_fake_processes(
 
 
 async def test_same_model_concurrent_acquire_starts_once(monkeypatch: pytest.MonkeyPatch) -> None:
-    manager = ModelManager(make_catalog(), max_loaded_models=2, shutdown_timeout=0.1)
+    manager = ModelManager(make_catalog(), shutdown_timeout=0.1)
     gate = asyncio.Event()
     starts = install_fake_processes(monkeypatch, manager, gates={"model-a": gate})
 
@@ -100,20 +102,27 @@ async def test_same_model_concurrent_acquire_starts_once(monkeypatch: pytest.Mon
     await manager.shutdown()
 
 
-async def test_different_models_start_in_parallel(monkeypatch: pytest.MonkeyPatch) -> None:
-    manager = ModelManager(make_catalog(), max_loaded_models=2, shutdown_timeout=0.1)
+async def test_different_models_start_one_at_a_time(monkeypatch: pytest.MonkeyPatch) -> None:
+    manager = ModelManager(make_catalog(), shutdown_timeout=0.1)
     gates = {"model-a": asyncio.Event(), "model-b": asyncio.Event()}
     starts = install_fake_processes(monkeypatch, manager, gates=gates)
 
     task_a = asyncio.create_task(manager.acquire("model-a"))
     task_b = asyncio.create_task(manager.acquire("model-b"))
-    while len(starts) < 2:
+    while not starts:
         await asyncio.sleep(0)
-    assert set(starts) == {"model-a", "model-b"}
+    for _ in range(20):
+        await asyncio.sleep(0)
+    assert starts == ["model-a"]
 
     gates["model-a"].set()
+    lease_a = await task_a
+    while len(starts) < 2:
+        await asyncio.sleep(0)
+    assert starts == ["model-a", "model-b"]
+
     gates["model-b"].set()
-    lease_a, lease_b = await asyncio.gather(task_a, task_b)
+    lease_b = await task_b
     assert lease_a.backend.port != lease_b.backend.port
 
     await lease_a.release()
@@ -121,7 +130,7 @@ async def test_different_models_start_in_parallel(monkeypatch: pytest.MonkeyPatc
     health = await manager.health()
     assert health["loaded_models"] == ["model-a", "model-b"]
     assert health["loaded_model"] == "model-a"
-    assert health["capacity"] == {"max_loaded_models": 2, "resident_count": 2}
+    assert health["capacity"] == {"resident_count": 2, "gpu": None}
     await manager.shutdown()
 
 
@@ -235,7 +244,6 @@ async def test_unload_cancels_in_progress_startup_before_releasing_port(
 async def test_process_crash_marks_failed_and_can_restart(monkeypatch: pytest.MonkeyPatch) -> None:
     manager = ModelManager(
         make_catalog(),
-        max_loaded_models=2,
         failure_cooldown=0.0,
         shutdown_timeout=0.1,
     )
@@ -343,8 +351,8 @@ async def test_startup_diagnostic_drains_exit_tail_and_reuses_cooldown_id(
     await manager.shutdown()
 
 
-async def test_timeout_and_parallel_backend_diagnostics_are_isolated(monkeypatch: pytest.MonkeyPatch) -> None:
-    manager = ModelManager(make_catalog(), startup_timeout=0, max_loaded_models=2)
+async def test_timeout_and_concurrent_backend_diagnostics_are_isolated(monkeypatch: pytest.MonkeyPatch) -> None:
+    manager = ModelManager(make_catalog(), startup_timeout=0)
 
     async def fake_start(backend: Backend) -> None:
         if backend.spec.name == "model-a":
@@ -532,22 +540,6 @@ async def test_lease_works_as_async_context_manager() -> None:
     await manager.shutdown()
 
 
-async def test_capacity_rejects_second_active_model_then_evicts_idle_one(monkeypatch: pytest.MonkeyPatch) -> None:
-    manager = ModelManager(make_catalog(), max_loaded_models=1, shutdown_timeout=0.1)
-    install_fake_processes(monkeypatch, manager)
-
-    first = await manager.acquire("model-a")
-    with pytest.raises(CapacityError, match="active or loading"):
-        await manager.acquire("model-b")
-
-    await first.release()
-    second = await manager.acquire("model-b")
-    assert second.backend.spec.name == "model-b"
-    assert manager._backends["model-a"].state is BackendState.STOPPED
-    await second.release()
-    await manager.shutdown()
-
-
 async def test_restart_uses_the_current_spec_of_a_recreated_alias(monkeypatch: pytest.MonkeyPatch) -> None:
     manager = ModelManager(make_catalog(), shutdown_timeout=0.1)
     install_fake_processes(monkeypatch, manager)
@@ -560,5 +552,191 @@ async def test_restart_uses_the_current_spec_of_a_recreated_alias(monkeypatch: p
     lease = await manager.acquire("model-a")
 
     assert lease.backend.spec.context_length == 16384
+    await lease.release()
+    await manager.shutdown()
+
+
+class FakeGpu:
+    """Simulated GPU shared with a foreign user. Loaded backends consume their planned memory."""
+
+    def __init__(self, total_gib: int, foreign_gib: int):
+        self.total = total_gib * GIB
+        self.foreign = foreign_gib * GIB
+        self.running: dict[str, int] = {}
+
+    def query(self) -> tuple[int, int]:
+        return self.total - self.foreign - sum(self.running.values()), self.total
+
+
+def gpu_spec(name: str, weights_gib: int) -> ModelSpec:
+    return ModelSpec(
+        name=name,
+        model_path=MODEL_DIR,
+        context_length=4096,
+        weights_bytes=weights_gib * GIB,
+        kv_bytes_per_token=0,
+    )
+
+
+def install_gpu_processes(monkeypatch: pytest.MonkeyPatch, manager: ModelManager, gpu: FakeGpu) -> list[str]:
+    starts: list[str] = []
+
+    async def fake_start(backend: Backend) -> None:
+        assert backend.memory is not None
+        starts.append(backend.spec.name)
+        gpu.running[backend.spec.name] = backend.memory.total_bytes
+        backend.process = FakeProcess()
+
+    async def fake_stop(backend: Backend) -> None:
+        gpu.running.pop(backend.spec.name, None)
+        process = backend.process
+        if isinstance(process, FakeProcess) and process.returncode is None:
+            process.finish(0)
+        backend.process = None
+
+    monkeypatch.setattr(manager, "_start_backend", fake_start)
+    monkeypatch.setattr(manager, "_stop_backend", fake_stop)
+    return starts
+
+
+def gpu_manager(gpu: FakeGpu, *specs: ModelSpec) -> ModelManager:
+    return ModelManager(ModelCatalog(specs), gpu_memory=gpu.query, shutdown_timeout=0.1, settle_seconds=0)
+
+
+def test_command_carries_the_memory_plan() -> None:
+    spec = gpu_spec("a", 10)
+    plan = plan_memory(spec, 100 * GIB)
+    command = ModelManager(ModelCatalog([spec]))._command(spec, 30000, plan)
+
+    assert int(flag_value(command, "--kv-cache-memory-bytes")) == plan.kv_cache_bytes
+    assert float(flag_value(command, "--gpu-memory-utilization")) == plan.gpu_memory_utilization
+    assert "--kv-cache-memory-bytes" not in ModelManager(ModelCatalog([spec]))._command(spec, 30000)
+
+
+async def test_model_that_fits_loads_without_evicting(monkeypatch: pytest.MonkeyPatch) -> None:
+    gpu = FakeGpu(total_gib=96, foreign_gib=20)
+    manager = gpu_manager(gpu, gpu_spec("a", 10), gpu_spec("b", 10))
+    starts = install_gpu_processes(monkeypatch, manager, gpu)
+
+    lease_a = await manager.acquire("a")
+    lease_b = await manager.acquire("b")
+
+    assert starts == ["a", "b"]
+    assert lease_a.backend.state is BackendState.READY
+    assert lease_b.backend.memory is not None
+    health = await manager.health()
+    assert health["capacity"]["gpu"]["total_bytes"] == 96 * GIB
+    await lease_a.release()
+    await lease_b.release()
+    await manager.shutdown()
+
+
+async def test_least_recently_used_idle_backend_is_evicted_for_room(monkeypatch: pytest.MonkeyPatch) -> None:
+    gpu = FakeGpu(total_gib=96, foreign_gib=52)
+    a, b, c = gpu_spec("a", 10), gpu_spec("b", 10), gpu_spec("c", 10)
+    manager = gpu_manager(gpu, a, b, c)
+    starts = install_gpu_processes(monkeypatch, manager, gpu)
+
+    for name in ("a", "b"):
+        await (await manager.acquire(name)).release()
+    await (await manager.acquire("a")).release()  # "b" is now the least recently used
+    lease_c = await manager.acquire("c")
+
+    assert starts == ["a", "b", "c"]
+    assert manager._backends["b"].state is BackendState.STOPPED
+    assert manager._backends["a"].state is BackendState.READY
+    assert set(gpu.running) == {"a", "c"}
+    await lease_c.release()
+    await manager.shutdown()
+
+
+async def test_backend_with_active_lease_is_never_evicted(monkeypatch: pytest.MonkeyPatch) -> None:
+    gpu = FakeGpu(total_gib=96, foreign_gib=40)
+    manager = gpu_manager(gpu, gpu_spec("a", 10), gpu_spec("b", 10), gpu_spec("c", 10))
+    install_gpu_processes(monkeypatch, manager, gpu)
+
+    active = await manager.acquire("a")
+    await (await manager.acquire("b")).release()
+    with pytest.raises(CapacityError, match="insufficient GPU memory"):
+        # a (active) and b together leave no room, so only b may be evicted; c still does not fit alongside a.
+        gpu.foreign = 70 * GIB
+        await manager.acquire("c")
+
+    assert manager._backends["a"].state is BackendState.READY
+    assert manager._backends["a"].active_requests == 1
+    assert "a" in gpu.running
+    await active.release()
+    await manager.shutdown()
+
+
+async def test_insufficient_memory_reports_needed_and_free_gib(monkeypatch: pytest.MonkeyPatch) -> None:
+    gpu = FakeGpu(total_gib=96, foreign_gib=80)
+    manager = gpu_manager(gpu, gpu_spec("a", 10))
+    install_gpu_processes(monkeypatch, manager, gpu)
+
+    with pytest.raises(CapacityError) as error:
+        await manager.acquire("a")
+
+    assert error.value.free_bytes == 16 * GIB
+    assert error.value.needed_bytes > 16 * GIB
+    assert "GiB needed" in str(error.value) and "GiB free" in str(error.value)
+    assert diagnose_backend_error(error.value).code == "insufficient_gpu_memory"
+    # The failed admission must not leave the startup gate held.
+    gpu.foreign = 0
+    lease = await manager.acquire("a")
+    await lease.release()
+    await manager.shutdown()
+
+
+async def test_validate_fits_rejects_specs_larger_than_the_gpu() -> None:
+    gpu = FakeGpu(total_gib=96, foreign_gib=90)
+    manager = gpu_manager(gpu, gpu_spec("a", 10))
+
+    await manager.validate_fits(gpu_spec("small", 40))
+    with pytest.raises(ValueError, match="GPU has 96.0 GiB"):
+        await manager.validate_fits(gpu_spec("huge", 95))
+    await manager.shutdown()
+
+
+async def test_failed_startup_releases_the_gate_for_the_next_model(monkeypatch: pytest.MonkeyPatch) -> None:
+    gpu = FakeGpu(total_gib=96, foreign_gib=0)
+    manager = ModelManager(
+        ModelCatalog([gpu_spec("a", 1), gpu_spec("b", 1)]),
+        gpu_memory=gpu.query,
+        failure_cooldown=0.0,
+        shutdown_timeout=0.1,
+        settle_seconds=0,
+    )
+    install_gpu_processes(monkeypatch, manager, gpu)
+    real_start = manager._start_backend
+
+    async def flaky_start(backend: Backend) -> None:
+        if backend.spec.name == "a":
+            raise RuntimeError("boom")
+        await real_start(backend)
+
+    monkeypatch.setattr(manager, "_start_backend", flaky_start)
+    with pytest.raises(RuntimeError):
+        await manager.acquire("a")
+
+    lease = await asyncio.wait_for(manager.acquire("b"), timeout=2)
+    await lease.release()
+    await manager.shutdown()
+
+
+async def test_unloading_a_loading_model_releases_the_gate(monkeypatch: pytest.MonkeyPatch) -> None:
+    manager = ModelManager(make_catalog(), shutdown_timeout=0.1)
+    gates = {"model-a": asyncio.Event(), "model-b": asyncio.Event()}
+    starts = install_fake_processes(monkeypatch, manager, gates=gates)
+
+    loading = asyncio.create_task(manager.acquire("model-a"))
+    while not starts:
+        await asyncio.sleep(0)
+    assert await manager.unload("model-a")
+    with pytest.raises(RuntimeError, match="cancelled"):
+        await loading
+
+    gates["model-b"].set()
+    lease = await asyncio.wait_for(manager.acquire("model-b"), timeout=2)
     await lease.release()
     await manager.shutdown()
