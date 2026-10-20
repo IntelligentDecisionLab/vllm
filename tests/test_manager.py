@@ -359,32 +359,6 @@ def test_command_defaults_to_single_gpu_when_parallelism_is_unspecified() -> Non
     assert command[command.index("--tensor-parallel-size") + 1] == "1"
 
 
-async def test_backend_env_strips_admin_api_key(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Backend subprocesses must not inherit the management API credential."""
-    monkeypatch.setenv("VLLM_ADMIN_API_KEY", "secret-admin-key")
-    monkeypatch.setenv("VLLM_GW_TEST_KEEPME", "keep")
-    spec = ModelSpec(name="model-a", model_path="org/a")
-    manager = ModelManager(ModelCatalog([spec], Path("models.toml")))
-
-    captured: dict[str, object] = {}
-
-    async def fake_exec(*args: object, **kwargs: object) -> FakeProcess:
-        captured["env"] = kwargs.get("env")
-        process = FakeProcess()
-        process.finish(1)
-        return process
-
-    monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_exec)
-    backend = Backend(spec, 30999)
-    with pytest.raises(RuntimeError, match="exited with code 1"):
-        await manager._start_backend(backend)
-
-    env = captured["env"]
-    assert isinstance(env, dict)
-    assert "VLLM_ADMIN_API_KEY" not in env
-    assert env.get("VLLM_GW_TEST_KEEPME") == "keep"
-
-
 async def test_reload_keeps_loaded_model_and_adds_new(monkeypatch: pytest.MonkeyPatch) -> None:
     manager = ModelManager(make_catalog(), max_loaded_models=2, shutdown_timeout=0.1)
     install_fake_processes(monkeypatch, manager)

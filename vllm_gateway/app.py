@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import json
 import logging
-import secrets
 from collections.abc import AsyncIterator, Iterable
 from contextlib import asynccontextmanager
 from pathlib import Path
@@ -63,10 +62,7 @@ def _forward_headers(headers: httpx.Headers) -> dict[str, str]:
     }
 
 
-_PUBLIC_BACKEND_MESSAGE = "Model backend is unavailable; consult the management API with the diagnostic ID."
-
-
-def _backend_error(exc: BaseException, *, detailed: bool) -> JSONResponse:
+def _backend_error(exc: BaseException) -> JSONResponse:
     diagnostic = diagnose_backend_error(exc)
     LOGGER.error("backend unavailable diagnostic_id=%s code=%s", diagnostic.diagnostic_id, diagnostic.code)
     return JSONResponse(
@@ -74,34 +70,12 @@ def _backend_error(exc: BaseException, *, detailed: bool) -> JSONResponse:
         content={
             "error": {
                 "type": "backend_unavailable",
-                "code": diagnostic.code if detailed else "backend_unavailable",
-                "message": diagnostic.message if detailed else _PUBLIC_BACKEND_MESSAGE,
+                "code": diagnostic.code,
+                "message": diagnostic.message,
                 "diagnostic_id": diagnostic.diagnostic_id,
             }
         },
     )
-
-
-def _model_status(status: dict[str, object], *, detailed: bool) -> dict[str, object]:
-    result = dict(status)
-    diagnostic = result.get("diagnostic")
-    if result.get("error"):
-        result["error"] = (
-            diagnostic["message"] if detailed and isinstance(diagnostic, dict) else _PUBLIC_BACKEND_MESSAGE
-        )
-    if not detailed:
-        result.pop("diagnostic", None)
-        if isinstance(diagnostic, dict):
-            result["diagnostic_id"] = diagnostic["diagnostic_id"]
-    return result
-
-
-def _health_status(status: dict[str, object], *, detailed: bool) -> dict[str, object]:
-    result = dict(status)
-    residents = result.get("resident_models")
-    if isinstance(residents, list):
-        result["resident_models"] = [_model_status(item, detailed=detailed) for item in residents]
-    return result
 
 
 def create_app(
@@ -112,10 +86,7 @@ def create_app(
     default_model: str | None = None,
     pinned_default: bool = False,
     catalog_path: str | Path | None = None,
-    admin_api_key: str | None = None,
 ) -> FastAPI:
-    if not admin_api_key or not admin_api_key.strip():
-        raise ValueError("VLLM_ADMIN_API_KEY must be set to enable the management API")
     request_default = catalog.canonicalize(default_model)
     config_path = Path(catalog_path).expanduser().resolve() if catalog_path is not None else None
 
@@ -137,11 +108,11 @@ def create_app(
 
     @app.get("/health")
     async def health() -> dict[str, object]:
-        return _health_status(await manager.health(), detailed=False)
+        return await manager.health()
 
     @app.get("/ready")
     async def ready() -> JSONResponse:
-        status = _health_status(await manager.health(), detailed=False)
+        status = await manager.health()
         if not status["loaded_models"]:
             return JSONResponse(status_code=503, content={**status, "status": "not_ready"})
         return JSONResponse(content=status)
@@ -163,37 +134,14 @@ def create_app(
                 content={"error": {"message": str(exc), "type": "invalid_request_error"}},
             )
 
-    def require_admin(request: Request) -> JSONResponse | None:
-        host = request.client.host if request.client else ""
-        if host not in {"127.0.0.1", "::1", "testclient"}:
-            return JSONResponse(
-                status_code=403,
-                content={"error": {"message": "management API is localhost-only", "type": "forbidden"}},
-            )
-        authorization = request.headers.get("authorization", "")
-        scheme, _, token = authorization.partition(" ")
-        if scheme.lower() != "bearer" or not secrets.compare_digest(token, admin_api_key):
-            return JSONResponse(
-                status_code=401,
-                headers={"WWW-Authenticate": "Bearer"},
-                content={"error": {"message": "invalid management API key", "type": "unauthorized"}},
-            )
-        return None
-
     @app.get("/admin/models")
-    async def admin_models(request: Request) -> JSONResponse:
-        denied = require_admin(request)
-        if denied:
-            return denied
-        return JSONResponse(content=_health_status(await manager.health(), detailed=True))
+    async def admin_models() -> JSONResponse:
+        return JSONResponse(content=await manager.health())
 
     @app.post("/admin/models/{model_id:path}/load")
-    async def load_model(model_id: str, request: Request) -> JSONResponse:
-        denied = require_admin(request)
-        if denied:
-            return denied
+    async def load_model(model_id: str) -> JSONResponse:
         try:
-            return JSONResponse(content=_model_status(await manager.load(model_id), detailed=True))
+            return JSONResponse(content=await manager.load(model_id))
         except KeyError as exc:
             return JSONResponse(
                 status_code=404,
@@ -201,13 +149,10 @@ def create_app(
             )
         except (CapacityError, FileNotFoundError, PortUnavailable, RuntimeError, TimeoutError, ValueError) as exc:
             LOGGER.exception("failed to load model %s", model_id)
-            return _backend_error(exc, detailed=True)
+            return _backend_error(exc)
 
     @app.post("/admin/reload")
-    async def reload_config(request: Request) -> JSONResponse:
-        denied = require_admin(request)
-        if denied:
-            return denied
+    async def reload_config() -> JSONResponse:
         if config_path is None:
             return JSONResponse(
                 status_code=400,
@@ -240,13 +185,10 @@ def create_app(
         return JSONResponse(content=result)
 
     @app.post("/admin/models/{model_id:path}/unload")
-    async def unload_model(model_id: str, request: Request) -> JSONResponse:
-        denied = require_admin(request)
-        if denied:
-            return denied
+    async def unload_model(model_id: str) -> JSONResponse:
         try:
             unloaded = await manager.unload(model_id)
-            status = _model_status(await manager.backend_status(model_id), detailed=True)
+            status = await manager.backend_status(model_id)
             return JSONResponse(content={"unloaded": unloaded, "model": status})
         except KeyError as exc:
             return JSONResponse(
@@ -309,7 +251,7 @@ def create_app(
             )
         except (CapacityError, FileNotFoundError, PortUnavailable, RuntimeError, TimeoutError, ValueError) as exc:
             LOGGER.exception("failed to start model %s", model_name)
-            return _backend_error(exc, detailed=False)
+            return _backend_error(exc)
 
         backend = lease.backend
         headers = {key: value for key, value in request.headers.items() if key.lower() not in HOP_BY_HOP_HEADERS}

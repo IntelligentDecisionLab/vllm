@@ -266,7 +266,7 @@ def test_apply_model_defaults() -> None:
 def test_app_endpoints() -> None:
     catalog = ModelCatalog.from_toml_file(MODELS_TOML)
     manager = ModelManager(catalog)
-    app = create_app(catalog, manager, admin_api_key="test-admin-key")
+    app = create_app(catalog, manager)
 
     with TestClient(app) as client:
         health_resp = client.get("/health")
@@ -457,7 +457,7 @@ def test_companion_script_defaults() -> None:
 def test_app_proxy_validation_errors() -> None:
     catalog = ModelCatalog.from_toml_file(MODELS_TOML)
     manager = ModelManager(catalog)
-    app = create_app(catalog, manager, admin_api_key="test-admin-key")
+    app = create_app(catalog, manager)
 
     with TestClient(app) as client:
         # Invalid JSON
@@ -480,7 +480,7 @@ def test_app_proxy_validation_errors() -> None:
 def test_app_get_single_model_endpoint() -> None:
     catalog = ModelCatalog.from_toml_file(MODELS_TOML)
     manager = ModelManager(catalog)
-    app = create_app(catalog, manager, admin_api_key="test-admin-key")
+    app = create_app(catalog, manager)
 
     with TestClient(app) as client:
         # Known model: qwen3.8-27b
@@ -592,7 +592,7 @@ def test_catalog_whitespace_model_lookup() -> None:
 async def test_app_proxy_lease_cleanup_on_http_error(monkeypatch: pytest.MonkeyPatch) -> None:
     catalog = ModelCatalog.from_toml_file(MODELS_TOML)
     manager = ModelManager(catalog)
-    app = create_app(catalog, manager, admin_api_key="test-admin-key")
+    app = create_app(catalog, manager)
 
     from vllm_gateway.manager import Backend
 
@@ -624,7 +624,7 @@ async def test_app_proxy_lease_cleanup_on_http_error(monkeypatch: pytest.MonkeyP
 async def test_app_proxy_lease_cleanup_on_unhandled_exception(monkeypatch: pytest.MonkeyPatch) -> None:
     catalog = ModelCatalog.from_toml_file(MODELS_TOML)
     manager = ModelManager(catalog)
-    app = create_app(catalog, manager, admin_api_key="test-admin-key")
+    app = create_app(catalog, manager)
 
     from vllm_gateway.manager import Backend
 

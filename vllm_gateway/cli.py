@@ -189,7 +189,6 @@ def main(argv: list[str] | None = None) -> None:
         default_model=default_model,
         pinned_default=bool(raw_default),
         catalog_path=args.config_file,
-        admin_api_key=os.getenv("VLLM_ADMIN_API_KEY"),
     )
 
     uvicorn.run(

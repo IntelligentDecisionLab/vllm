@@ -161,7 +161,6 @@ def make_app(
     default_model: str | None = None,
     *,
     catalog_path: Path | None = None,
-    admin_api_key: str = "test-admin-key",
 ) -> tuple[TestClient, FakeManager]:
     catalog = ModelCatalog(
         [
@@ -172,9 +171,9 @@ def make_app(
     )
     manager = FakeManager(catalog)
     app = create_app(  # type: ignore[arg-type]
-        catalog, manager, default_model=default_model, catalog_path=catalog_path, admin_api_key=admin_api_key
+        catalog, manager, default_model=default_model, catalog_path=catalog_path
     )
-    return TestClient(app, headers={"Authorization": f"Bearer {admin_api_key}"}), manager
+    return TestClient(app), manager
 
 
 def test_proxy_routes_each_model_to_its_resident_backend() -> None:
@@ -241,44 +240,7 @@ def test_models_endpoint_marks_multiple_models_loaded() -> None:
     assert ready.status_code == 200
 
 
-def test_admin_requires_configured_key() -> None:
-    from pytest import raises
-
-    with raises(ValueError, match="VLLM_ADMIN_API_KEY"):
-        make_app(admin_api_key="")
-    with raises(ValueError, match="VLLM_ADMIN_API_KEY"):
-        make_app(admin_api_key="  ")
-
-
-def test_admin_requires_bearer_key_for_all_operations() -> None:
-    client, manager = make_app()
-    endpoints = [
-        ("GET", "/admin/models"),
-        ("POST", "/admin/reload"),
-        ("POST", "/admin/models/a/load"),
-        ("POST", "/admin/models/a/unload"),
-    ]
-    with client:
-        for method, path in endpoints:
-            for authorization in ("", "Bearer wrong", "Basic test-admin-key", "Bearer "):
-                response = client.request(method, path, headers={"Authorization": authorization})
-                assert response.status_code == 401
-                assert response.headers["www-authenticate"] == "Bearer"
-                assert response.json()["error"]["type"] == "unauthorized"
-        assert manager.catalog is client.app.state.catalog
-        assert client.get("/admin/models").status_code == 200
-
-
-def test_admin_remains_localhost_only_with_valid_key() -> None:
-    client, _ = make_app()
-    with TestClient(
-        client.app, client=("192.0.2.10", 54321), headers={"Authorization": "Bearer test-admin-key"}
-    ) as remote:
-        assert remote.get("/admin/models").status_code == 403
-        assert remote.post("/admin/reload").status_code == 403
-
-
-def test_unprotected_routes_do_not_require_admin_key_and_unknown_admin_routes_do_not_proxy() -> None:
+def test_unknown_admin_routes_do_not_proxy() -> None:
     client, manager = make_app()
     with TestClient(client.app) as public:
         assert public.get("/health").status_code == 200
@@ -388,7 +350,7 @@ def test_admin_reload_without_config_file_returns_400() -> None:
     assert response.json()["error"]["type"] == "invalid_request_error"
 
 
-def test_load_details_and_proxy_summary_share_diagnostic_id(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_load_and_proxy_share_diagnostic(monkeypatch: pytest.MonkeyPatch) -> None:
     client, manager = make_app()
     diagnostic = diagnostic_from_exception(RuntimeError("secret"), code="kv_cache_memory_insufficient")
 
@@ -402,9 +364,7 @@ def test_load_details_and_proxy_summary_share_diagnostic_id(monkeypatch: pytest.
         public = client.post("/v1/chat/completions", json={"model": "a", "messages": []})
     assert admin.status_code == public.status_code == 503
     assert admin.json()["error"] == {"type": "backend_unavailable", **diagnostic.as_dict()}
-    assert public.json()["error"]["code"] == "backend_unavailable"
-    assert public.json()["error"]["diagnostic_id"] == diagnostic.diagnostic_id
-    assert "kv_cache_memory_insufficient" not in public.text
+    assert public.json()["error"] == admin.json()["error"]
     assert "secret" not in admin.text + public.text
     assert "/home" not in admin.text + public.text
 
@@ -431,15 +391,13 @@ def test_generic_startup_errors_never_echo_internal_text(
             assert "127.0.0.1" not in response.text
 
 
-def test_public_health_and_ready_hide_diagnostics_without_mutating_admin_status(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
+def test_health_and_ready_report_backend_diagnostic(monkeypatch: pytest.MonkeyPatch) -> None:
     client, manager = make_app()
     diagnostic = diagnostic_from_exception(RuntimeError("secret"), code="cuda_out_of_memory")
     status = {
         "loaded_models": [],
         "resident_models": [
-            {"name": "model-a", "state": "failed", "error": "secret /home/private", "diagnostic": diagnostic.as_dict()}
+            {"name": "model-a", "state": "failed", "error": diagnostic.message, "diagnostic": diagnostic.as_dict()}
         ],
     }
 
@@ -449,18 +407,9 @@ def test_public_health_and_ready_hide_diagnostics_without_mutating_admin_status(
     monkeypatch.setattr(manager, "health", health)
     with client:
         for path in ("/health", "/ready"):
-            public = client.get(path)
-            model = public.json()["resident_models"][0]
-            assert model["diagnostic_id"] == diagnostic.diagnostic_id
-            assert "diagnostic" not in model
-            assert "cuda_out_of_memory" not in public.text
-            assert "secret" not in public.text
-        admin = client.get("/admin/models")
-        model = admin.json()["resident_models"][0]
-        assert model["diagnostic"] == diagnostic.as_dict()
-        assert model["error"] == diagnostic.message
-        assert "secret" not in admin.text
-    assert status["resident_models"][0]["error"] == "secret /home/private"
+            model = client.get(path).json()["resident_models"][0]
+            assert model["diagnostic"] == diagnostic.as_dict()
+            assert model["error"] == diagnostic.message
 
 
 def test_proxy_transport_failure_is_safe_and_releases_lease(monkeypatch: pytest.MonkeyPatch) -> None:

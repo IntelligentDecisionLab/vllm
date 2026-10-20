@@ -702,9 +702,6 @@ class ModelManager:
         command = self._command(backend.spec, model_path, backend.port)
         LOGGER.info("starting vLLM backend for %s: %s", backend.spec.name, " ".join(command))
         env = os.environ.copy()
-        # Backends never need the management API credential; do not leak it into
-        # vLLM subprocess environments (e.g. crash dumps or in-process plugins).
-        env.pop("VLLM_ADMIN_API_KEY", None)
         cuda_home = os.getenv("CUDA_HOME", "/usr/local/cuda")
         if os.path.isdir(cuda_home):
             env["CUDA_HOME"] = cuda_home
