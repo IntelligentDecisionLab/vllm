@@ -1,122 +1,84 @@
-# Configuration and file placement
+# Configuration
 
-## Configuration sources and precedence
+## Gateway settings
 
-The gateway reads `models.toml` from the repository root by default. `--config` can specify another TOML file.
+| CLI flag | Environment variable | Default |
+| --- | --- | --- |
+| `--host` | `VLLM_SERVICE_HOST` | `0.0.0.0` |
+| `--port` | `VLLM_SERVICE_PORT` | `11432` |
+| `--hub-cache` | `HF_HUB_CACHE` | Hugging Face default (`~/.cache/huggingface/hub`) |
+| `--state-dir` | `VLLM_STATE_DIR` | `~/.local/state/vllm-gateway` |
+| `--backend-port`, `--backend-port-count` | `VLLM_BACKEND_PORT`, `VLLM_BACKEND_PORT_COUNT` | `30000`, `64` |
+| `--startup-timeout` | `VLLM_STARTUP_TIMEOUT` | `900` seconds |
+| `--backend-shutdown-timeout` | `VLLM_BACKEND_SHUTDOWN_TIMEOUT` | `30` seconds per backend |
+| `--graceful-shutdown-timeout` | `VLLM_GRACEFUL_SHUTDOWN_TIMEOUT` | `30` seconds for Uvicorn |
+| `--log-level` | `VLLM_SERVICE_LOG_LEVEL` | `info` |
 
-The configuration precedence for a single backend command is:
+The image sets `HF_HUB_CACHE=/data/huggingface/hub` and `VLLM_STATE_DIR=/state`. `HF_TOKEN` is read by `huggingface_hub` and is needed only for gated repositories. Keep it in `.env`, which is not committed.
 
-1. Global overrides provided by the gateway CLI or the corresponding `VLLM_*` environment variables.
-2. Per-model fields in `models.toml`.
-3. Values merged from `[default]` into the model entry.
-4. Built-in fallbacks in `ModelManager`.
+## Fixed vLLM settings
 
-TP, DP, GPU memory, sequence/token budgets, attention backend, and context are all resolved according to these rules. Global overrides affect every model, so verify before deployment that they do not break GPU isolation settings.
+These are constants in `vllm_gateway/manager.py`. Every backend gets them.
 
-## `models.toml`
-
-`[default]` contains values shared by all models; `["canonical-name"]` contains the model source and overrides. The current parser also accepts a `[models.<name>]` map and a `[[models]]` array of tables, but the repository itself uses root-level named tables.
-
-Common typed fields:
-
-| Category | Fields |
+| Setting | Value |
 | --- | --- |
-| Identity | `model_path`, `hf_repo`, `aliases`, `default` |
-| Capacity | `tensor_parallel_size`, `data_parallel_size`, `gpu_memory_utilization`, `max_num_seqs`, `max_num_batched_tokens` |
-| Context/KV | `context_length`, `kv_cache_dtype`, `rope_scaling`, `rope_scale`, `yarn_orig_ctx`, `rope_theta` |
-| Request behavior | `reasoning`, `reasoning_parser`, `tool_call_parser`, `chat_template` |
-| Lifecycle | `idle_seconds` |
-| Runtime | `attention_backend`, `device_ids`, `async_scheduling`, `flashinfer_autotune`, `enable_prefix_caching`, `vllm_args` |
-| Speculative decoding | `speculative_method`, `num_speculative_tokens` |
+| Idle unload | 3600 seconds |
+| `--max-num-seqs`, `--max-num-batched-tokens` | 16, 2048 |
+| `--kv-cache-dtype` | `fp8_e4m3` |
+| `--attention-backend` | `flashinfer` |
+| `--async-scheduling`, `--enable-flashinfer-autotune`, `--enable-prefix-caching` | on |
+| Tensor and data parallel | 1 (the container sees one GPU) |
+| Speculative decoding | `{"method": "mtp", "num_speculative_tokens": 2}` when the model has MTP weights |
 
-`device_ids` uses a TOML integer array (for example, `[0, 1]`); `async_scheduling`, `flashinfer_autotune`, and `enable_prefix_caching` use booleans. When unset, no flag is emitted; `false` emits the corresponding `--no-` flag to override a default of `true`. `speculative_method` is a string and `num_speculative_tokens` is an integer; `--speculative-config` is generated only when a method is set, and the token count may be omitted. These new fields support `[default]` and per-model values and have no additional CLI/environment override.
+## Family profile
 
-`model_path` can point to a local Transformers/Safetensors directory or a Hugging Face repo ID. If it looks like an explicit local path but does not exist, the gateway reports an error.
+The parsers come from `model_type` in `config.json` (the top-level type, then `text_config`). The table is `profile_for()` in `vllm_gateway/catalog.py`.
 
-The canonical name, normalized name, alias, model path, source, and Hugging Face repo must each be unique across the entire catalog. A name conflict stops the gateway before it binds the public port.
+| `model_type` | Reasoning parser | Tool-call parser |
+| --- | --- | --- |
+| `qwen3_<digit>…` (for example `qwen3_5`), `qwen3_next` | `qwen3` | `qwen3_coder` |
+| `qwen3`, `qwen3_moe` | `qwen3` | `hermes` |
+| anything else | none | none |
 
-### Shared GPU memory budget
+MTP is enabled only when `config.json` declares MTP layers (`mtp_num_hidden_layers` or `num_nextn_predict_layers`) and the safetensors tensor names contain `mtp.`. Some quantized repos keep the config field but drop the weights.
 
-`gpu_memory_utilization` is converted to vLLM's `--gpu-memory-utilization`; its value is a fraction of the GPU's **total memory**, not of the free memory at startup. At startup, vLLM requires free memory to cover at least `total memory × gpu_memory_utilization`; if an external process on the same GPU has already consumed too much memory, the backend exits before loading weights.
+A repo is listed as a model only when its `config.json` has an architecture ending in `ForCausalLM` or `ForConditionalGeneration`, it has `max_position_embeddings`, the layer and head fields needed for the KV size, and all of its safetensors files. A cache with a `.incomplete` blob is hidden.
 
-In the `qwen3.5-9b` incident on 2026-08-27, GPU 1 had 30.64 GiB remaining, but `0.35` required 33.24 GiB, so `vllm load` returned 503. After lowering that model's value to `0.30` (a 28.49 GiB budget) and hot-reloading, the backend completed weight loading, CUDA graph capture, and readiness.
+## Memory estimate
 
-When you encounter a similar error:
-
-1. Use `nvidia-smi` to check free memory on the target GPU and the other processes using it.
-2. Find the free/desired GiB reported by vLLM in the backend stderr; the gateway's 503 only summarizes the subprocess exit.
-3. Remove processes that should not coexist, or lower that model's `gpu_memory_utilization`, while preserving the space needed for weights, activations, CUDA graphs, and the KV cache.
-4. Run `POST /admin/reload` and load the model again; confirm that `/health` reaches `ready`, then send a completion smoke test.
-
-Do not convert all currently free memory into a fraction. Shared GPU usage changes, and operating near the limit can cause the next startup to fail again.
-
-### `vllm_args` boundary
-
-`vllm_args` is only for safe upstream parameters for which the gateway has no typed field. The gateway manages the following categories, which cannot be overridden in `vllm_args` or with `--vllm-arg`:
-
-- model identity, host, port, and served model name
-- TP/DP, GPU memory, context, sequence/token budget, and KV dtype
-- load format, runner, reasoning/tool parser, and chat template
-- attention backend and Hugging Face overrides
-- `--device-ids`, `--async-scheduling`, `--enable-flashinfer-autotune`, and `--speculative-config`
-- `--enable-chunked-prefill`, `--enable-prefix-caching`, and `--enable-auto-tool-choice`
-
-Protected flags are also rejected in underscore spelling, `--flag=value` form, and `--no-<flag>` form.
-
-The current catalog's generative models use the V1 chunked-prefill default, so the duplicate `--enable-chunked-prefill` has been removed. The prefix-caching default depends on model capabilities and the hybrid architecture; Qwen hybrid models retain `enable_prefix_caching = true` to preserve the behavior that was explicitly enabled before migration.
-
-The gateway retains its own fallbacks: `gpu_memory_utilization = 0.90`, `max_num_seqs = 256`, and `max_num_batched_tokens = 4096`. In vLLM 0.27.1, the GPU memory default is `0.92`; the `SchedulerConfig` seq/token dataclass defaults are `128` / `2048`, but `EngineArgs` adjusts them automatically at startup based on the device and usage. Catalog or global overrides still take precedence over gateway fallbacks.
-
-When adding a managed parameter, update `ModelSpec`, the catalog parser, CLI/manager precedence, and command-generation tests. Do not remove a flag from the protected set to bypass validation.
-
-## Environment variables
-
-The gateway source directly supports the main `VLLM_*` settings, including:
+`vllm_gateway/memory.py` computes, for a model and a context length:
 
 ```text
-VLLM_CONFIG_FILE
-VLLM_DEFAULT_MODEL
-VLLM_SERVICE_HOST / VLLM_SERVICE_PORT
-VLLM_ADMIN_API_KEY
-VLLM_BACKEND_PORT / VLLM_BACKEND_PORT_COUNT
-VLLM_MAX_LOADED_MODELS
-VLLM_TP_SIZE / VLLM_DP_SIZE
-VLLM_GPU_MEMORY_UTILIZATION
-VLLM_MAX_NUM_SEQS / VLLM_MAX_NUM_BATCHED_TOKENS
-VLLM_ATTENTION_BACKEND
-VLLM_CONTEXT_LENGTH
-VLLM_STARTUP_TIMEOUT / VLLM_BACKEND_SHUTDOWN_TIMEOUT
-VLLM_GRACEFUL_SHUTDOWN_TIMEOUT
-VLLM_MODEL_IDLE_SECONDS
-VLLM_SERVICE_LOG_LEVEL
+kv_per_token = 2 × full_attention_layers × kv_heads × head_dim × 1 byte (fp8)
+per_sequence = linear_state × LINEAR_STATE_FACTOR (5) + kv_per_token × context_length
+kv_pool      = per_sequence × KV_FULL_SEQS (2) × KV_MARGIN (1.2)
+estimate     = weights + kv_pool + OVERHEAD (4 GiB)
+required     = estimate + SAFETY (2 GiB)
 ```
 
-The deployment companion script supports additional lifecycle variables such as preload, PID/log paths, and stop timeout. The script is in `scripts/vllm` in the repository and is installed to `~/.local/bin/vllm` for deployment. It also supports `VLLM_ADMIN_KEY_FILE` for specifying a local key file; by default, it looks for `vllm-gateway/admin.key` under `XDG_CONFIG_HOME` (`~/.config` when unset). The gateway Python code does not read this file itself.
+- `full_attention_layers` counts `full_attention` entries in `layer_types`. Without `layer_types` it is `num_hidden_layers / full_attention_interval`, and otherwise `num_hidden_layers`. With MTP enabled the draft layers are added.
+- The backend is started with `--kv-cache-memory-bytes <kv_pool>` and `--gpu-memory-utilization <ceil(estimate / GPU total, 0.01)>`. With `--kv-cache-memory-bytes` set, vLLM skips memory profiling and reserves exactly that KV pool.
+- `linear_state` is the recurrent state of the linear-attention layers of a hybrid model (SSM state plus short convolution, computed from the `linear_*` fields and `mamba_ssm_dtype`). It is 0 for dense models. vLLM refuses to start when the KV pool cannot hold one request of the full context length, and for hybrid models it reserves several times the raw state per sequence, hence the factor.
+- A model loads only when the free memory of the whole GPU is at least `required`.
 
-## File placement
+Calibration on an RTX PRO 6000 (96 GiB) with Qwen3.5-9B:
 
-| Content | Location | Readers |
-| --- | --- | --- |
-| Version-controlled model catalog | `models.toml` or the file specified by `VLLM_CONFIG_FILE` | `ModelCatalog`, companion script |
-| Python package metadata and locked dependencies | `pyproject.toml`, `uv.lock` | uv, build backend |
-| Architecture and development guidelines | `docs/`, each level's `AGENTS.md` | people and coding agents |
-| Model weights and Hugging Face cache | local model path or Hugging Face cache outside the repository | vLLM, huggingface-hub |
-| Gateway PID/log | `~/.cache/vllm-gateway.pid`, `~/.cache/vllm-gateway.log` by default | companion script |
-| Management API key | `~/.config/vllm-gateway/admin.key` or `VLLM_ADMIN_KEY_FILE`; not version-controlled | companion script; directory 700, file 600 |
-| Python/test/build artifacts | `.venv/`, `__pycache__/`, `.pytest_cache/`, `build/`, `dist/`, `*.egg-info` | development tools; do not commit |
-| Agent harness state | `.agents/`, `.pi/` | agent tooling; excluded by `.gitignore` |
+- At 32768 tokens the weights took 18.1 GiB and the measured total was about 21 GiB, with no growth under four concurrent 14k-token prompts. `OVERHEAD_BYTES` is set from that.
+- An early formula without the recurrent state reserved 0.34 GiB at 8192 tokens, and vLLM refused to start because one request needs 0.37 GiB. Fitting the 8192 and 32768 token logs gives about 18.5 KB per token and 245 MB per sequence, against 51.5 MB of raw state. `LINEAR_STATE_FACTOR` is set from that.
 
-## Secrets
+Recalibrate the constants in `memory.py` when you change the fixed vLLM settings, the GPU, or add a model family. A pool that is too small shows up as `kv_cache_memory_insufficient`.
 
-Management endpoints require `VLLM_ADMIN_API_KEY` (it must be set to a non-empty value before startup) and remain restricted to loopback sources; the gateway refuses to start when it is unset. Calls to `GET /admin/models`, `POST /admin/reload`, `POST /admin/models/{model}/load`, and `POST /admin/models/{model}/unload` must include `Authorization: Bearer <key>`; the `models`, `load`, and `unload` commands in `scripts/vllm` use the same environment variable. `/health`, `/ready`, `/v1/*`, and other proxy routes do not require this key; the Authorization header on inference requests is forwarded to the backend as usual. Changing the key requires restarting the gateway; catalog reload does not update the key.
+## Files and users
 
-For convenient local operation, `scripts/vllm` prefers a non-empty `VLLM_ADMIN_API_KEY`; when it is unset, it reads the local key file and exports it to the gateway. The file contains only a single-line key, may have a trailing newline, must not contain `export` or an assignment, and the script does not execute its contents. Restrict the directory to 700 and the file to 600; updating or reinstalling the script does not modify this file, so `vllm models`, `vllm load`, and `vllm restart` can be used without repeatedly exporting the key manually. When running `python -m vllm_gateway` directly, you must still provide the environment variable yourself.
+| Content | Location |
+| --- | --- |
+| Models | Shared Hugging Face cache, mounted at `/data/huggingface` |
+| Aliases | `$VLLM_STATE_DIR/aliases.json` (the `gateway-state` volume) |
+| Backend output | Gateway log (`docker compose logs gateway`) |
+| Deployment settings | `.env` (not committed; template in `.env.example`) |
 
-Use a sufficiently long random value and pass it through a local key file with restricted permissions, the process environment, or an external secret manager. Avoid putting the key in CLI arguments, `models.toml`, README, docs, test fixtures, or log examples. A bearer key does not protect against users on the same host who can read the gateway process environment or memory of a process with the same UID; connections across hosts must not rely only on loopback checks and require TLS, a reverse proxy, and network isolation. Deployment secrets such as Hugging Face tokens and proxy credentials must likewise not be committed.
+The container runs as `GATEWAY_UID:GATEWAY_GID` with `umask 002`, so files it downloads into the shared cache belong to the cache's group and stay writable for its members.
 
-## Safe update workflow
+## Security
 
-1. After editing the catalog, first run the catalog and command-generation tests.
-2. Use the management key to call `POST /admin/reload` (for example, `printf 'Authorization: Bearer %s\n' "$VLLM_ADMIN_API_KEY" | curl --header @- -X POST http://127.0.0.1:11432/admin/reload`); first inspect the `added`, `removed`, `updated`, and `kept_loaded` fields in the response.
-3. Check `/health` and `/v1/models`. If weights need to be loaded, then run a GPU smoke test for the target model.
-4. When reload fails, do not restart to mask the parser problem; the service retains the old catalog, so first correct the configuration error indicated by the response and log.
+The gateway has no authentication and listens on `0.0.0.0`. Anyone who can reach the port can create and delete aliases, trigger downloads and use every model. Keep it on an internal network. The Hugging Face token must not be committed or put in logs or command-line arguments.

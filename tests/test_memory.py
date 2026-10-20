@@ -56,3 +56,30 @@ def test_utilization_is_rounded_up_to_two_decimals_and_capped() -> None:
 
 def test_parse_nvidia_smi_output_in_mib() -> None:
     assert _parse_smi("57700, 97887\n") == (57700 * 1024**2, 97887 * 1024**2)
+
+
+def test_hybrid_pool_covers_what_vllm_needs_for_one_request() -> None:
+    """Qwen3.5-9B, from the vLLM logs: one 8192-token request needs 0.37 GiB, one 32768-token request ~0.853 GB."""
+
+    raw_state = 24 * (32 * 128 * 128 * 4 + 3 * (2 * 16 * 128 + 32 * 128) * 2)
+    per_token = 2 * 9 * 4 * 256
+
+    def pool(context: int) -> int:
+        model = ModelSpec(
+            name="m",
+            model_path="/m",
+            context_length=context,
+            weights_bytes=18 * GIB,
+            kv_bytes_per_token=per_token,
+            linear_state_bytes=raw_state,
+        )
+        return plan_memory(model, 96 * GIB).kv_cache_bytes
+
+    assert pool(8192) >= 2 * int(0.37 * GIB)
+    assert pool(32768) >= 2 * 853_000_000
+
+
+def test_dense_model_has_no_recurrent_state_term() -> None:
+    plan = plan_memory(spec(1, 57344, 4096), 96 * GIB)
+
+    assert plan.kv_cache_bytes == math.ceil(57344 * 4096 * KV_FULL_SEQS * KV_MARGIN)

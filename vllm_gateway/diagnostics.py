@@ -48,7 +48,9 @@ class BackendOutput:
         text = _ANSI.sub("", (self.tail + chunk).decode("utf-8", errors="replace")).lower()
         if "cuda out of memory" in text or "torch.outofmemoryerror" in text:
             self.code = "cuda_out_of_memory"
-        elif "no available memory for the cache blocks" in text and self.code is None:
+        elif (
+            "no available memory for the cache blocks" in text or "larger than the available kv cache memory" in text
+        ) and self.code is None:
             self.code = "kv_cache_memory_insufficient"
         self.tail = (self.tail + chunk)[-self.LIMIT :]
 

@@ -14,6 +14,15 @@ def test_kv_signal_survives_chunks_ansi_and_tail_overflow() -> None:
     assert output.code == "kv_cache_memory_insufficient"
 
 
+def test_kv_pool_smaller_than_one_request_is_classified() -> None:
+    output = BackendOutput()
+    output.feed(
+        b"ValueError: To serve at least one request with the model's max seq len (8192), (0.37 GiB KV cache is "
+        b"needed, which is larger than the available KV cache memory (0.34 GiB)."
+    )
+    assert output.code == "kv_cache_memory_insufficient"
+
+
 @pytest.mark.parametrize("text", [b"CUDA out of memory", b"torch.OutOfMemoryError: secret /home/user"])
 def test_cuda_oom_has_fixed_safe_summary(text: bytes) -> None:
     output = BackendOutput()

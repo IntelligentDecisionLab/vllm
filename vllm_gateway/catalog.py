@@ -46,6 +46,7 @@ class ModelInfo:
     max_context: int
     weights_bytes: int
     kv_bytes_per_token: int
+    linear_state_bytes: int
     mtp: bool
 
     @property
@@ -59,6 +60,7 @@ class ModelInfo:
             "size_bytes": self.weights_bytes,
             "max_context": self.max_context,
             "kv_bytes_per_token": self.kv_bytes_per_token,
+            "linear_state_bytes": self.linear_state_bytes,
             "mtp": self.mtp,
             "reasoning_parser": profile.reasoning_parser,
             "tool_call_parser": profile.tool_call_parser,
@@ -97,6 +99,28 @@ def _positive_int(value: Any) -> int:
     return value if isinstance(value, int) and not isinstance(value, bool) and value > 0 else 0
 
 
+def _linear_state_bytes(text: dict[str, Any], linear_layers: int) -> int:
+    """Raw recurrent state of all linear-attention layers for one sequence (SSM plus short convolution)."""
+
+    fields = [
+        _positive_int(text.get(name))
+        for name in (
+            "linear_num_key_heads",
+            "linear_num_value_heads",
+            "linear_key_head_dim",
+            "linear_value_head_dim",
+            "linear_conv_kernel_dim",
+        )
+    ]
+    if not linear_layers or not all(fields):
+        return 0
+    key_heads, value_heads, key_dim, value_dim, conv_kernel = fields
+    ssm_bytes = 2 if str(text.get("mamba_ssm_dtype", "float32")) in {"bfloat16", "float16"} else 4
+    ssm = value_heads * key_dim * value_dim * ssm_bytes
+    conv = (conv_kernel - 1) * (2 * key_heads * key_dim + value_heads * value_dim) * 2
+    return linear_layers * (ssm + conv)
+
+
 def inspect_snapshot(repo_id: str, snapshot: Path) -> ModelInfo | None:
     """Read a snapshot's config and weights. Return None when it cannot be served."""
 
@@ -130,10 +154,13 @@ def inspect_snapshot(repo_id: str, snapshot: Path) -> ModelInfo | None:
     interval = _positive_int(text.get("full_attention_interval"))
     if isinstance(layer_types, list):
         full_layers = sum(item == "full_attention" for item in layer_types)
+        linear_layers = sum(item == "linear_attention" for item in layer_types)
     elif interval:
         full_layers = layers // interval
+        linear_layers = layers - full_layers
     else:
         full_layers = layers
+        linear_layers = 0
 
     mtp_layers = _positive_int(text.get("mtp_num_hidden_layers")) or _positive_int(text.get("num_nextn_predict_layers"))
     mtp = bool(mtp_layers) and any(key.startswith("mtp.") or ".mtp." in key for key in keys)
@@ -150,6 +177,7 @@ def inspect_snapshot(repo_id: str, snapshot: Path) -> ModelInfo | None:
         max_context=max_context,
         weights_bytes=sum(path.stat().st_size for path in paths),
         kv_bytes_per_token=2 * full_layers * kv_heads * head_dim,
+        linear_state_bytes=_linear_state_bytes(text, linear_layers),
         mtp=mtp,
     )
 
@@ -222,6 +250,7 @@ class ModelSpec:
     context_length: int | None = None
     weights_bytes: int = 0
     kv_bytes_per_token: int = 0
+    linear_state_bytes: int = 0
     reasoning_parser: str | None = None
     tool_call_parser: str | None = None
     mtp: bool = False
@@ -246,6 +275,7 @@ def _spec_from_info(alias: str, info: ModelInfo, context_length: int) -> ModelSp
         context_length=context_length,
         weights_bytes=info.weights_bytes,
         kv_bytes_per_token=info.kv_bytes_per_token,
+        linear_state_bytes=info.linear_state_bytes,
         reasoning_parser=profile.reasoning_parser,
         tool_call_parser=profile.tool_call_parser,
         mtp=info.mtp,

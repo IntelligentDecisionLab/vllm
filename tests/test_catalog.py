@@ -112,6 +112,44 @@ def test_mtp_requires_weights_and_adds_draft_layer_kv(hub: Path) -> None:
     assert stripped.kv_bytes_per_token == 2 * 2 * 4 * 256
 
 
+QWEN35_9B_LIKE: dict[str, Any] = {
+    "architectures": ["Qwen3_5ForConditionalGeneration"],
+    "model_type": "qwen3_5",
+    "text_config": {
+        "model_type": "qwen3_5_text",
+        "num_hidden_layers": 32,
+        "layer_types": (["linear_attention"] * 3 + ["full_attention"]) * 8,
+        "num_attention_heads": 16,
+        "num_key_value_heads": 4,
+        "head_dim": 256,
+        "hidden_size": 4096,
+        "max_position_embeddings": 262144,
+        "linear_num_key_heads": 16,
+        "linear_num_value_heads": 32,
+        "linear_key_head_dim": 128,
+        "linear_value_head_dim": 128,
+        "linear_conv_kernel_dim": 4,
+        "mamba_ssm_dtype": "float32",
+        "mtp_num_hidden_layers": 1,
+    },
+}
+
+
+def test_hybrid_model_reports_recurrent_state_per_sequence(hub: Path) -> None:
+    make_model(hub, "org/hybrid", QWEN35_9B_LIKE, keys=("model.layers.0.weight", "mtp.fc.weight"))
+    make_model(hub, "org/dense", DENSE_CONFIG)
+
+    hybrid = find_local_model(hub, "org/hybrid")
+    dense = find_local_model(hub, "org/dense")
+
+    ssm = 32 * 128 * 128 * 4
+    conv = 3 * (2 * 16 * 128 + 32 * 128) * 2
+    assert hybrid is not None
+    assert hybrid.linear_state_bytes == 24 * (ssm + conv)
+    assert hybrid.kv_bytes_per_token == 2 * (8 + 1) * 4 * 256
+    assert dense is not None and dense.linear_state_bytes == 0
+
+
 def test_layer_count_fallbacks_without_layer_types(hub: Path) -> None:
     interval = {**DENSE_CONFIG, "model_type": "qwen3_next", "full_attention_interval": 4}
     make_model(hub, "org/interval", interval)

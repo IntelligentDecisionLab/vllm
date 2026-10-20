@@ -10,7 +10,10 @@ GIB = 1 << 30
 
 # Calibrate these on the target GPU with a real model; every estimate derives from them.
 KV_FULL_SEQS = 2  # sequences of full context length the KV cache must hold
-KV_MARGIN = 1.2  # hybrid linear-attention state and block rounding
+KV_MARGIN = 1.2  # block rounding
+# vLLM reserves several times the raw recurrent state per sequence for hybrid models. Qwen3.5-9B needed
+# 245 MB per sequence for 51.5 MB of raw state (fitted from its 8k and 32k KV cache logs), so 5.0 leaves a margin.
+LINEAR_STATE_FACTOR = 5.0
 # CUDA context, CUDA graphs and activations. Measured about 2 GiB on top of weights + KV for Qwen3.5-9B.
 OVERHEAD_BYTES = 4 * GIB
 SAFETY_BYTES = 2 * GIB  # headroom that must stay free on top of the estimate
@@ -33,9 +36,8 @@ class MemoryPlan:
 
 
 def plan_memory(spec: ModelSpec, gpu_total_bytes: int) -> MemoryPlan:
-    kv_cache_bytes = math.ceil(
-        spec.kv_bytes_per_token * (spec.context_length or 0) * KV_FULL_SEQS * KV_MARGIN,
-    )
+    per_sequence = spec.linear_state_bytes * LINEAR_STATE_FACTOR + spec.kv_bytes_per_token * (spec.context_length or 0)
+    kv_cache_bytes = math.ceil(per_sequence * KV_FULL_SEQS * KV_MARGIN)
     total = spec.weights_bytes + kv_cache_bytes + OVERHEAD_BYTES
     utilization = min(1.0, math.ceil(total * 100 / gpu_total_bytes) / 100)
     return MemoryPlan(spec.weights_bytes, kv_cache_bytes, OVERHEAD_BYTES, utilization)

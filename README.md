@@ -1,219 +1,84 @@
-# vLLM multi-model gateway
+# Shared vLLM gateway
 
-This project provides a single OpenAI-compatible endpoint (default `:11432`) and starts multiple independent vLLM backends on demand from the repository's `models.toml`. Each resident model has its own private port, process, request lease, and idle policy; by default, up to two models can remain resident at the same time.
+An OpenAI-compatible endpoint (default `:11432`) for a lab server. It serves the models in a shared Hugging Face cache through independent vLLM backends, one per user alias, on a single GPU. It runs in Docker and has no authentication, so it belongs on an internal network only.
 
-The current catalog includes:
+## How it works
 
-- `qwen3.8-27b` (default, `Qwen/Qwen3.8-27B-FP8`, dual GPU)
-- `qwen3.5-9b` (`Qwen/Qwen3.5-9B`, GPU 1)
+- A **model** is a complete Hugging Face repo in the cache (`/data/huggingface/hub`). `GET /models/local` lists them and `POST /models/download` fetches more.
+- An **alias** binds a model to a context length. Create one per use (`POST /aliases`) and call it through the OpenAI API by putting the alias in `model`.
+- Each alias gets its own vLLM process, started on its first request or by `POST /aliases/{alias}/load`.
+- Everything except the model and context length is fixed. Parsers and speculative decoding come from the model's `config.json`, and the GPU memory share is computed from the model size and context length.
+- A backend that sits idle for one hour is unloaded. When a new model does not fit in the free GPU memory, idle backends are evicted, least recently used first. A backend with active requests is never evicted.
+- Only one backend loads at a time (about 5 minutes for a 9B model), so a request for a second unloaded model waits for the first load to finish.
 
-The gateway canonicalizes aliases, changes the request's `model` to the canonical ID, and then sends it to the corresponding backend. Requests for the same model share one vLLM scheduler; different models can be loaded and served in parallel.
+## Deploy with Docker
 
-For detailed design and maintenance information:
-
-- [Gateway architecture](docs/architecture.md)
-- [Configuration and file placement](docs/configuration.md)
-- [Development and verification](docs/development.md)
-
-## Installation
+The image is built on `vllm/vllm-openai`, so the host needs the NVIDIA container toolkit.
 
 ```bash
-uv sync --extra runtime --extra test
+cp .env.example .env     # set GATEWAY_UID, GATEWAY_GID and GATEWAY_GPU
+docker compose up -d --build
+docker compose logs -f gateway
 ```
 
-The current runtime contract and lock file use vLLM 0.27.1. The gateway itself can run unit tests without a GPU runtime; actually loading models still requires a compatible NVIDIA/CUDA environment.
+`.env` settings:
 
-## Model catalog
+| Variable | Meaning |
+| --- | --- |
+| `GATEWAY_UID`, `GATEWAY_GID` | User and group the container runs as. Use the owner of the shared cache and its group (`hfusers`) so downloads stay writable for everyone |
+| `GATEWAY_GPU` | UUID of the one GPU the gateway may use (`nvidia-smi -L`) |
+| `GATEWAY_PORT` | Published port, default 11432 |
+| `HF_CACHE_DIR` | Host path of the shared cache, default `/data/huggingface` |
+| `HF_TOKEN` | Only for gated or private repositories |
 
-`models.toml` supports global defaults and per-model overrides. The repository's current core configuration is shown below; see [`models.toml`](models.toml) for the complete GPU placement and runtime fields:
+Aliases are stored in the `gateway-state` volume and survive restarts. `docker compose stop` drains active requests and stops every backend (it waits up to 120 seconds).
 
-```toml
-[default]
-context_length = 262144
-kv_cache_dtype = "fp8_e4m3"
-tensor_parallel_size = 1
-data_parallel_size = 1
-gpu_memory_utilization = 0.45
-max_num_seqs = 16
-max_num_batched_tokens = 2048
-idle_seconds = 1800
-reasoning_parser = "qwen3"
-tool_call_parser = "qwen3_coder"
-attention_backend = "flashinfer"
-async_scheduling = true
-flashinfer_autotune = true
-enable_prefix_caching = true
-speculative_method = "mtp"
-num_speculative_tokens = 2
-
-["qwen3.8-27b"]
-model_path = "Qwen/Qwen3.8-27B-FP8"
-gpu_memory_utilization = 0.35
-tensor_parallel_size = 2
-max_num_seqs = 64
-idle_seconds = 0.0
-default = true
-aliases = ["qwen3.8-27b-fp8"]
-num_speculative_tokens = 3
-
-["qwen3.5-9b"]
-model_path = "Qwen/Qwen3.5-9B"
-context_length = 131072
-gpu_memory_utilization = 0.35
-device_ids = [1]
-max_num_seqs = 128
-idle_seconds = 0.0
-aliases = ["qwen3.5-9b"]
-```
-
-`model_path` can be a Hugging Face repo ID or a local directory containing Transformers/Safetensors weights. If the canonical name, normalized name, alias, model path, or HF source conflicts across models, the gateway reports an explicit error at startup rather than silently routing to the wrong model.
-
-`attention_backend` is an official catalog field; do not put `--attention-backend` in `vllm_args`, because the gateway rejects managed parameters there.
-
-When `reasoning = "off"`, the gateway adds the following to a chat request when the request does not specify it:
-
-```json
-{"chat_template_kwargs":{"enable_thinking":false}}
-```
-
-## Starting the gateway
-
-Run directly:
-
-```bash
-uv run python -m vllm_gateway
-```
-
-Preload the default model:
-
-```bash
-uv run python -m vllm_gateway --preload
-```
-
-Preload multiple models at once:
-
-```bash
-uv run python -m vllm_gateway \
-  --preload-model qwen3.8-27b \
-  --preload-model qwen3.5-9b
-```
-
-Important options:
-
-```text
---backend-port 30000          start of the private port range
---backend-port-count 64       number of ports available to the allocator
---max-loaded-models 2         hard limit for resident/loading backends
---idle-seconds 0              global idle unload; 0 means keep loaded
---startup-timeout 900         backend model load timeout
---backend-shutdown-timeout 30 request drain/process stop timeout
---tensor-parallel-size N      explicitly override TP for all models
---data-parallel-size N        explicitly override DP for all models
---vllm-arg ARG                additional safe vLLM argument; repeatable
-```
-
-Identity, network, and catalog-managed resource flags cannot be overridden through `--vllm-arg`; examples include `--port`, `--model`, `--served-model-name`, TP/DP, memory, context, and KV cache. Use the catalog or the gateway's official CLI options for these settings.
-
-## Companion script (`scripts/vllm`)
-
-The companion script is located at `scripts/vllm` in the repository. Install it to `~/.local/bin/vllm` the first time:
-
-```bash
-install -m 755 scripts/vllm ~/.local/bin/vllm
-```
-
-The script uses `/home/sam/Projects/vllm` by default and can also be configured with `VLLM_PROJECT_DIR`. It manages only the gateway PID; `ModelManager` stops all backend children during graceful shutdown and does not guess process ownership using `fuser`, `pgrep`, or port regexes.
-
-```bash
-vllm start
-vllm status
-vllm models
-vllm load qwen3.8-27b
-vllm load qwen3.5-9b
-vllm unload qwen3.8-27b
-vllm restart
-vllm stop
-vllm logs 200
-vllm download
-```
-
-`start` waits for `/health`; when preload is configured, it then waits for `/ready`. If a model still has active requests, `unload` returns 409 and does not forcibly interrupt them.
-
-Common environment variables:
-
-```text
-VLLM_PROJECT_DIR
-VLLM_CONFIG_FILE
-VLLM_SERVICE_HOST / VLLM_SERVICE_PORT
-VLLM_BACKEND_PORT / VLLM_BACKEND_PORT_COUNT
-VLLM_MAX_LOADED_MODELS
-VLLM_PRELOAD / VLLM_PRELOAD_MODELS (comma-separated)
-VLLM_MODEL_IDLE_SECONDS
-VLLM_TP_SIZE / VLLM_DP_SIZE
-VLLM_GPU_MEMORY_UTILIZATION
-VLLM_GRACEFUL_SHUTDOWN_TIMEOUT
-VLLM_PID_FILE / VLLM_LOG_FILE
-```
+The GPU may be shared with other people's processes. The gateway reads the free memory of the whole GPU before every load and never signals processes it did not start.
 
 ## API
 
-Liveness and resident state:
+Examples assume `http://idlab:11432`.
 
 ```bash
-curl http://127.0.0.1:11432/health
-curl http://127.0.0.1:11432/ready
-curl http://127.0.0.1:11432/v1/models
+# Models available in the cache, with size, maximum context and the aliases that use them
+curl http://idlab:11432/models/local
+
+# Download a model in the background, then poll the job
+curl -X POST http://idlab:11432/models/download -H 'content-type: application/json' \
+  -d '{"repo_id": "Qwen/Qwen3.5-9B"}'
+curl http://idlab:11432/models/downloads/<job id>
+
+# Create an alias, optionally load it, and use it
+curl -X POST http://idlab:11432/aliases -H 'content-type: application/json' \
+  -d '{"alias": "alice-9b-64k", "model": "Qwen/Qwen3.5-9B", "context_length": 65536}'
+curl -X POST http://idlab:11432/aliases/alice-9b-64k/load
+curl http://idlab:11432/v1/chat/completions -H 'content-type: application/json' \
+  -d '{"model": "alice-9b-64k", "messages": [{"role": "user", "content": "Hello"}]}'
 ```
 
-- `/health`: gateway liveness, `loaded_models`, each backend's state/port/PID/active requests, and capacity.
-- `/ready`: returns 200 when at least one backend has completed strict readiness; otherwise returns 503.
-- `/v1/models`: the complete catalog; a model's `loaded` value means that its backend is currently ready.
+| Endpoint | Purpose |
+| --- | --- |
+| `GET /models/local` | Loadable models in the cache. Repos that are still downloading or incomplete are hidden |
+| `POST /models/download` | Body `{repo_id, revision?}`. Returns 202 and a job. Only safetensors, JSON, tokenizer and template files are fetched. Rejected with 507 when less than 20 GiB of disk would remain |
+| `GET /models/downloads`, `GET /models/downloads/{id}` | Job state: `queued`, `running`, `succeeded`, `failed`. Jobs run one at a time and are kept in memory |
+| `GET /aliases` | Aliases with their backend state |
+| `POST /aliases` | Body `{alias, model, context_length}`. `alias` matches `[A-Za-z0-9._-]{1,64}`. `context_length` is between 1024 and the model's maximum. Returns 400 when the model could never fit in the GPU |
+| `DELETE /aliases/{alias}` | Stops the backend and removes the alias. Returns 409 while it has active requests |
+| `POST /aliases/{alias}/load`, `POST /aliases/{alias}/unload` | Load now, or unload. Unload returns 409 while requests are active |
+| `GET /v1/models`, `GET /v1/models/{alias}` | OpenAI model list with a `loaded` flag |
+| `GET /health`, `GET /ready` | Gateway state, backend states and free GPU memory. `/ready` returns 503 until a backend is ready |
+| any other path | Proxied to the alias named in the JSON `model` field |
 
-Inference:
+Requests without `model` return 400, and only exact alias names route (a repo id returns 404). To change an alias's context length, delete it and create it again.
 
-```bash
-curl http://127.0.0.1:11432/v1/chat/completions \
-  -H 'content-type: application/json' \
-  -d '{
-    "model": "qwen3.8-27b",
-    "messages": [{"role": "user", "content": "Introduce vLLM in one sentence"}],
-    "temperature": 0.2,
-    "max_tokens": 128,
-    "stream": true
-  }'
-```
+When a model does not fit, the request fails with 503 and `code: insufficient_gpu_memory`, which states how many GiB were needed and free. Other load failures return a safe `code` and a `diagnostic_id` to look up in `docker compose logs`.
 
-A JSON request without `model` uses the catalog default. OpenAI SDK clients can set `base_url` to `http://127.0.0.1:11432/v1`.
-
-Local management API (accepts loopback clients only):
+## Development
 
 ```bash
-curl http://127.0.0.1:11432/admin/models
-curl -X POST http://127.0.0.1:11432/admin/models/qwen3.8-27b/load
-curl -X POST http://127.0.0.1:11432/admin/models/qwen3.8-27b/unload
-```
-
-Hot-reload the configuration file:
-
-```bash
-curl -X POST http://127.0.0.1:11432/admin/reload
-```
-
-The gateway reparses `models.toml` and atomically replaces the catalog without restarting the service: newly added models are loaded lazily on their first request; backends for changed or removed specs drain and then stop; a loaded model with an identical spec is unaffected (its process is not restarted). A parse failure returns 400 and the old configuration continues serving. The response includes an `added` / `removed` / `updated` / `kept_loaded` diff summary. If `--default-model` was specified at startup, reload does not change the default model.
-
-## Backend lifecycle and security
-
-- A backend port is mapped deterministically from the canonical model name into a bounded private range; collisions use deterministic probing.
-- If an external process occupies a port, the gateway only skips it or reports an error; it never kills that process.
-- A backend enters ready only when `/health == 200` and `/v1/models == 200` and contains the expected canonical model.
-- Concurrent first requests for the same model share one startup task; different models can load in parallel when capacity permits.
-- When capacity is full, only a backend without active requests is unloaded using LRU; if all backends are active/loading, a new model load returns 503.
-- Shutdown and idle unload first enter draining; after active leases complete, the gateway-owned process group is stopped.
-
-## Tests
-
-```bash
+uv sync --extra test --extra dev
 uv run --extra test python -m pytest -q
+uv run --extra dev ruff check . && uv run --extra dev ruff format --check .
 ```
 
-Run GPU smoke tests after confirming hardware capacity. If model loading fails because of VRAM or a runtime flag, first inspect `vllm logs` and the backend error diagnostics in `/health`; do not arbitrarily change context, KV dtype, or memory fraction before verifying the cause.
+Unit tests need no GPU. See [architecture](docs/architecture.md), [configuration](docs/configuration.md) and [development](docs/development.md).

@@ -2,145 +2,100 @@
 
 ## Environment
 
-The project requires Python 3.12 or newer and uses uv to manage the lock file. The gateway's FastAPI/httpx unit tests do not require a GPU; vLLM is an optional runtime dependency.
+The project requires Python 3.12 or newer and uses uv to manage the lock file. The unit tests use FastAPI, httpx and fake processes, so they need neither a GPU nor vLLM. vLLM is an optional runtime dependency (`--extra runtime`) because the Docker image already contains it.
 
 ```bash
-uv sync --extra runtime --extra test
-```
-
-When developing only the gateway without loading models, you can omit the `runtime` extra:
-
-```bash
-uv sync --extra test
+uv sync --extra test --extra dev
 ```
 
 ## Entry points
 
 ```bash
 uv run python -m vllm_gateway --help
-uv run python -m vllm_gateway
-uv run python -m vllm_gateway --preload
 ```
 
-The `vllm-service` and `vllm-gateway` scripts in `pyproject.toml` both call the same CLI main function.
+The `vllm-service` and `vllm-gateway` scripts in `pyproject.toml` call the same main function. `docker compose up -d --build` runs the same module inside the image.
 
 ## Test areas
 
-- `tests/test_catalog.py`: TOML parsing, CLI/environment precedence, command generation, model defaults, and some compatibility tests.
-- `tests/test_app.py`: FastAPI routing, stream lease cleanup, management API, and hot reload.
-- `tests/test_manager.py`: asynchronous lifecycle, concurrent startup, capacity, draining, crashes, port ownership, and reload invariants.
-- `tests/test_script.py`: start/status/load/unload/restart/stop behavior of the repository's `scripts/vllm`, tested with a temporary fake service, and process ownership protection.
+- `tests/test_catalog.py`: cache scan, `config.json` parsing (dense, hybrid, MTP), family profiles, alias validation and persistence.
+- `tests/test_memory.py`: the memory estimate and the `nvidia-smi` fallback parser.
+- `tests/test_downloads.py`: download jobs, deduplication, disk check and pruning, with fake Hub functions.
+- `tests/test_app.py`: HTTP routing, model/alias/download endpoints, stream lease cleanup, diagnostics. Uses `FakeManager`.
+- `tests/test_manager.py`: asynchronous lifecycle, startup serialization, memory admission and eviction with a fake GPU, draining, crashes, ports.
+- `tests/test_diagnostics.py`: failure classification.
+
+Narrow the loop according to the change:
+
+```bash
+uv run --extra test python -m pytest -q tests/test_catalog.py tests/test_memory.py tests/test_downloads.py
+uv run --extra test python -m pytest -q tests/test_app.py tests/test_manager.py
+```
 
 Full verification:
 
 ```bash
 uv run --extra test python -m pytest -q
-```
-
-Narrow the loop according to the scope of the change:
-
-```bash
-uv run --extra test python -m pytest -q tests/test_catalog.py
-uv run --extra test python -m pytest -q tests/test_app.py tests/test_manager.py
-uv run --extra test python -m pytest -q tests/test_script.py
-```
-
-Package build:
-
-```bash
-uv build
-```
-
-## CI and Ruff gates
-
-GitHub Actions runs on pushes to `main` and when pull requests are opened or updated, using a Python 3.12 CPU-only runner. CI installs the `test` and `dev` extras, then runs Ruff linting, Ruff format checks, and the full pytest suite in order; it does not install the GPU/CUDA-dependent `runtime` extra.
-
-Run the same checks locally with:
-
-```bash
-uv sync --extra test --extra dev
 uv run --extra dev ruff check .
 uv run --extra dev ruff format --check .
-uv run --extra test python -m pytest -q
 ```
 
-After installing pre-commit, commits automatically run Ruff fixes and formatting:
-
-```bash
-uv tool install pre-commit
-pre-commit install
-pre-commit run --all-files
-```
-
-The repository does not yet have a type-check gate.
+GitHub Actions runs the same three commands on pushes to `main` and on pull requests, on a CPU-only runner. Install the hooks with `uv tool install pre-commit && pre-commit install`. The repository has no type-check gate.
 
 ## Change workflow
 
-### Catalog field or command option
+### Backend option or alias field
 
-1. Add a typed field to `ModelSpec` and handle supported key spellings in the TOML parser.
-2. Define the precedence of CLI overrides, model specs, and fallbacks explicitly in `ModelManager._command()`.
-3. If vLLM manages the option, add it to the protected flags so that `vllm_args` cannot generate duplicate or conflicting arguments.
-4. Update catalog-parsing and command-generation tests, then synchronize `models.toml` and the user documentation.
+1. Add the field to `ModelSpec` and to `ModelCatalog` (resolution and the persisted JSON).
+2. Expose it in the alias API in `app.py` if users should choose it.
+3. Emit the flag in `ModelManager._command()` and cover it in `tests/test_manager.py`.
+4. If it changes memory use, update `plan_memory()` and its tests.
 
 ### Proxy or lifecycle
 
-- Every successful acquire path in the proxy must release its lease, including HTTP errors, SSE close, client cancellation, and unexpected exceptions.
-- Manager concurrency tests use `FakeProcess`, `asyncio.Event`, and monkeypatching to control startup/stop without starting real vLLM.
-- State-transition changes must cover concurrent first loads, waiter cancellation, active unload, drain timeout, process crashes, and shutdown.
-- Do not infer ownership with `fuser`, `pgrep`, port regexes, or a machine-wide process scan.
+- Write down which of the invariants in [architecture](architecture.md#backend-lifecycle) the change touches before editing, and add a test for each.
+- Every successful acquire path in the proxy must release its lease, including HTTP errors, SSE close, client cancellation and unexpected exceptions.
+- Manager tests use `FakeProcess`, `asyncio.Event`, `FakeGpu` and monkeypatching to control startup and stop without vLLM.
+- Do not infer ownership with `fuser`, `pgrep`, port regexes or a machine-wide process scan.
 
-### Companion script
+## Backend failures
 
-The companion script version is in `scripts/vllm` in the repository; both `tests/test_script.py` and `test_catalog.py` read this file. Install it to `~/.local/bin/vllm` the first time for deployment:
+When a load fails, the API returns 503 with `error.code`, a safe `message` and a `diagnostic_id`. The `diagnostic_id` is also logged with the failure and the backend's merged stdout/stderr, which the gateway writes to its own log and keeps (at most 64 KiB) in memory:
 
 ```bash
-install -m 755 scripts/vllm ~/.local/bin/vllm
+docker compose logs gateway | grep -F '<diagnostic_id>'
 ```
-
-After modifying the script, run `uv run --extra test python -m pytest -q tests/test_script.py` to verify lifecycle and process ownership behavior.
-
-## Investigate backend failures through the management-side cause and diagnostic ID
-
-The management endpoint `/admin/models/{model}/load` still returns HTTP 503 when backend loading fails, and the JSON `error` adds `code`, a safe `message`, and `diagnostic_id`. `vllm load <model>` preserves the JSON body and returns curl's non-zero exit status (usually 22 for an HTTP error), which can be used for shell automation.
 
 | `error.code` | Meaning |
 | --- | --- |
-| `kv_cache_memory_insufficient` | Unable to allocate KV cache blocks |
+| `insufficient_gpu_memory` | Not enough free GPU memory even after evicting idle backends. The message gives GiB needed and free |
+| `kv_cache_memory_insufficient` | vLLM could not allocate KV cache blocks |
 | `cuda_out_of_memory` | Explicit CUDA/PyTorch OOM |
 | `backend_startup_timeout` | Readiness was not reached before the startup deadline |
-| `backend_startup_failed` | Unrecognized startup failure; no cause is inferred |
+| `backend_startup_failed` | Unrecognized startup failure. No cause is inferred |
 | `backend_exited` | A started backend exited unexpectedly |
-| `backend_capacity_exceeded` | Backend slots are in use or loading |
 | `backend_port_unavailable` | No backend port is available |
-| `model_files_unavailable` | Required model files are unavailable |
+| `model_files_unavailable` | The snapshot directory no longer exists |
 | `invalid_backend_configuration` | The backend configuration is invalid |
 
-`resident_models[].diagnostic` in `/admin/models` retains the last failure reason for that generation. The same ID is reused during the retry cooldown, and a new generation receives a new ID; this is not a permanent history database. A gateway startup failure from the public inference API returns only a `backend_unavailable` summary and ID; `/health` and `/ready` likewise do not include detailed classification. HTTP transport errors from the gateway to the upstream still return 502, using `backend_request_failed` and a separate ID; HTTP bodies/SSE responses from the backend itself are not rewritten.
+`GET /aliases` and `GET /health` keep the last failure of each backend. The same ID is reused during the retry cooldown and a new attempt gets a new ID. Transport errors between the gateway and a backend return 502 with `backend_request_failed`. Bodies and SSE streams from a backend are forwarded unchanged.
 
-The merged stdout/stderr of every backend is continuously written to the gateway log, with a tail of at most 64 KiB retained in memory; failure summaries do not expose the original traceback, paths, or credentials. After receiving an ID, locate the failure record and inspect nearby output by model/generation:
+## Deploying and the GPU smoke test
 
-```bash
-grep -F '<diagnostic_id>' "${VLLM_LOG_FILE:-$HOME/.cache/vllm-gateway.log}"
-```
-
-The new code takes effect only after restarting the gateway. The companion script must also be reinstalled (a restart unloads resident models, so check for active requests first):
+Docker is the only deployment path. On the server:
 
 ```bash
-install -m 755 scripts/vllm ~/.local/bin/vllm
-vllm restart
+git clone -b <branch> https://github.com/novis10813/vllm.git && cd vllm
+cp .env.example .env     # set GATEWAY_UID, GATEWAY_GID, GATEWAY_GPU
+docker compose up -d --build
 ```
 
-## GPU smoke test
+Changes to command generation, memory estimation or the image need this smoke test on the target GPU. The GPU may be shared, so record its memory and other users' processes first and compare at the end.
 
-After unit tests pass, only changes to runtime, the catalog, or backend commands require a GPU smoke test:
-
-```bash
-vllm restart
-vllm load <model>
-vllm status
-curl http://127.0.0.1:11432/ready
-curl http://127.0.0.1:11432/v1/models
-```
-
-Then send one non-streaming and one streaming completion, confirming HTTP 200, canonical model routing, and that active requests return to 0 after the stream ends. Model load time and VRAM usage depend on the hardware, so do not treat a GPU smoke test as part of ordinary unit testing.
+1. `nvidia-smi` baseline for the gateway's GPU.
+2. `GET /health` returns 200 and shows the GPU's free and total memory.
+3. Download a small dense model and a hybrid one (for example `Qwen/Qwen3-0.6B` and `Qwen/Qwen3.5-9B`) and wait for the jobs to succeed. Confirm that the new files are writable by the cache's group.
+4. Create an alias for the hybrid model and load it. In the log, `reserved … GiB memory for KV Cache` should match the estimate and the measured GPU use should stay below it. Send one non-streaming and one streaming chat completion, and one long prompt with several concurrent requests.
+5. Create more aliases than fit. Loading the last one must evict the least recently used idle backend. An alias that cannot fit an empty GPU must be rejected with 400 at creation.
+6. `docker compose restart` keeps the aliases. `docker compose down` returns quickly, and the GPU memory returns to the baseline.
+7. Inside the image, `nvcc --version` must be CUDA 12.9 or newer for Blackwell (SM 12.x) FlashInfer JIT. To debug a backend by hand, set `CUDA_HOME=/usr/local/cuda` and put `/usr/local/cuda/bin` on `PATH`.
