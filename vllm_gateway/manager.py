@@ -9,7 +9,6 @@ import signal
 import socket
 import sys
 import time
-from collections.abc import Iterable
 from dataclasses import dataclass, field
 from enum import StrEnum
 from typing import Any
@@ -17,10 +16,17 @@ from uuid import uuid4
 
 import httpx
 
-from .catalog import ModelCatalog, ModelSpec, resolve_model_path
+from .catalog import ModelCatalog, ModelSpec
 from .diagnostics import BackendDiagnostic, BackendOutput, BackendStartupError, diagnostic_from_exception
 
 LOGGER = logging.getLogger("vllm_gateway")
+
+IDLE_SECONDS = 3600.0
+MAX_NUM_SEQS = 16
+MAX_NUM_BATCHED_TOKENS = 2048
+KV_CACHE_DTYPE = "fp8_e4m3"
+ATTENTION_BACKEND = "flashinfer"
+NUM_SPECULATIVE_TOKENS = 2
 
 
 class BackendState(StrEnum):
@@ -153,34 +159,6 @@ class ModelManager:
         BackendState.READY,
         BackendState.DRAINING,
     }
-    _PROTECTED_VLLM_FLAGS = {
-        "--model",
-        "--model-path",
-        "--host",
-        "--port",
-        "--served-model-name",
-        "--tensor-parallel-size",
-        "--data-parallel-size",
-        "--gpu-memory-utilization",
-        "--max-model-len",
-        "--max-num-seqs",
-        "--max-num-batched-tokens",
-        "--kv-cache-dtype",
-        "--load-format",
-        "--runner",
-        "--reasoning-parser",
-        "--tool-call-parser",
-        "--chat-template",
-        "--attention-backend",
-        "--hf-overrides",
-        "--device-ids",
-        "--async-scheduling",
-        "--enable-flashinfer-autotune",
-        "--speculative-config",
-        "--enable-chunked-prefill",
-        "--enable-prefix-caching",
-        "--enable-auto-tool-choice",
-    }
 
     def __init__(
         self,
@@ -188,46 +166,23 @@ class ModelManager:
         *,
         backend_port: int = 30000,
         backend_port_count: int = 64,
-        max_loaded_models: int | None = None,
-        tensor_parallel_size: int | None = None,
-        data_parallel_size: int | None = None,
-        gpu_memory_utilization: float | None = None,
-        max_num_seqs: int | None = None,
-        max_num_batched_tokens: int | None = None,
-        attention_backend: str | None = None,
+        max_loaded_models: int = 2,
         startup_timeout: float = 900.0,
         shutdown_timeout: float = 30.0,
-        idle_seconds: float = 0.0,
-        context_length_override: int | None = None,
+        idle_seconds: float = IDLE_SECONDS,
         failure_cooldown: float = 2.0,
-        vllm_args: tuple[str, ...] = (),
     ):
-        if tensor_parallel_size is not None and tensor_parallel_size < 1:
-            raise ValueError("tensor_parallel_size must be at least 1")
-        if data_parallel_size is not None and data_parallel_size < 1:
-            raise ValueError("data_parallel_size must be at least 1")
-        configured_limit = min(2, len(catalog.specs)) if max_loaded_models is None else max_loaded_models
-        if configured_limit < 1:
+        if max_loaded_models < 1:
             raise ValueError("max_loaded_models must be at least 1")
-        self._max_loaded_models_defaulted = max_loaded_models is None
-        self._validate_extra_args(vllm_args, "global vLLM arguments")
 
         self.catalog = catalog
-        self.backend_port = backend_port  # compatibility: now the allocator range start
+        self.backend_port = backend_port
         self.backend_port_count = backend_port_count
-        self.max_loaded_models = configured_limit
-        self.tensor_parallel_size = tensor_parallel_size
-        self.data_parallel_size = data_parallel_size
-        self.gpu_memory_utilization = gpu_memory_utilization
-        self.max_num_seqs = max_num_seqs
-        self.max_num_batched_tokens = max_num_batched_tokens
-        self.attention_backend = attention_backend
+        self.max_loaded_models = max_loaded_models
         self.startup_timeout = startup_timeout
         self.shutdown_timeout = shutdown_timeout
         self.idle_seconds = idle_seconds
-        self.context_length_override = context_length_override
         self.failure_cooldown = failure_cooldown
-        self.vllm_args = vllm_args
 
         self._lock = asyncio.Lock()
         self._changed = asyncio.Condition(self._lock)
@@ -238,25 +193,10 @@ class ModelManager:
         self._idle_task: asyncio.Task[None] | None = None
         self._client = httpx.AsyncClient(timeout=httpx.Timeout(connect=5.0, read=None, write=10.0, pool=5.0))
 
-    @classmethod
-    def _validate_extra_args(cls, args: Iterable[str], source: str) -> None:
-        for arg in args:
-            if not arg.startswith("--"):
-                continue
-            flag = arg.split("=", 1)[0]
-            normalized_flag = flag.replace("_", "-")
-            if normalized_flag.startswith("--no-"):
-                normalized_flag = "--" + normalized_flag.removeprefix("--no-")
-            if normalized_flag in cls._PROTECTED_VLLM_FLAGS:
-                raise ValueError(f"{source} cannot override gateway-managed option {flag}")
-
-    async def start(self, preload: str | Iterable[str] | None = None) -> None:
+    async def start(self) -> None:
         self._started = True
-        if self.idle_seconds > 0 or any(spec.idle_seconds and spec.idle_seconds > 0 for spec in self.catalog.specs):
+        if self.idle_seconds > 0:
             self._idle_task = asyncio.create_task(self._idle_reaper(), name="vllm-idle-reaper")
-        if preload:
-            names = [preload] if isinstance(preload, str) else list(preload)
-            await asyncio.gather(*(self.load(name) for name in names))
 
     async def shutdown(self) -> None:
         if self._idle_task:
@@ -302,64 +242,6 @@ class ModelManager:
             await asyncio.gather(*watcher_tasks, return_exceptions=True)
         await self._client.aclose()
         self._started = False
-
-    async def reload_catalog(self, new_catalog: ModelCatalog) -> dict[str, Any]:
-        """Swap in a new catalog, stopping backends whose spec changed or was removed.
-
-        Unchanged models with resident backends keep running untouched; newly added
-        models start lazily on their first request.
-        """
-        old_specs = {spec.name: spec for spec in self.catalog.specs}
-        new_specs = {spec.name: spec for spec in new_catalog.specs}
-        added = sorted(set(new_specs) - set(old_specs))
-        removed = sorted(set(old_specs) - set(new_specs))
-        updated = sorted(name for name in set(old_specs) & set(new_specs) if old_specs[name] != new_specs[name])
-        kept = sorted(set(old_specs) & set(new_specs) - set(updated))
-
-        cancelled_startups: list[asyncio.Task[None]] = []
-        stop_tasks: list[asyncio.Task[None]] = []
-        async with self._lock:
-            if self._stopping:
-                raise RuntimeError("model manager is shutting down")
-            for name in (*removed, *updated):
-                backend = self._backends.pop(name, None)
-                if backend is None:
-                    continue
-                if backend.start_task and not backend.start_task.done():
-                    backend.state = BackendState.DRAINING
-                    backend.start_task.cancel()
-                    cancelled_startups.append(backend.start_task)
-                elif backend.state in self._RESIDENT_STATES or backend.process is not None:
-                    backend.state = BackendState.DRAINING
-                    if not backend.stop_task or backend.stop_task.done():
-                        backend.stop_task = asyncio.create_task(
-                            self._drain_and_stop(backend, backend.generation, self.shutdown_timeout),
-                            name=f"vllm-reload-{name}",
-                        )
-                    stop_tasks.append(backend.stop_task)
-            kept_loaded = sorted(
-                name
-                for name in kept
-                if (backend := self._backends.get(name)) and backend.state in self._RESIDENT_STATES
-            )
-            self.catalog = new_catalog
-            if self._max_loaded_models_defaulted:
-                self.max_loaded_models = min(2, len(new_catalog.specs))
-            self._changed.notify_all()
-
-        if cancelled_startups:
-            await asyncio.gather(*cancelled_startups, return_exceptions=True)
-        if stop_tasks:
-            await asyncio.gather(*stop_tasks, return_exceptions=True)
-        return {
-            "reloaded": True,
-            "config_file": str(new_catalog.config_file),
-            "default_model": new_catalog.default.name,
-            "added": added,
-            "removed": removed,
-            "updated": updated,
-            "kept_loaded": kept_loaded,
-        }
 
     async def load(self, model_name: str | None) -> dict[str, Any]:
         lease = await self.acquire(model_name)
@@ -475,6 +357,7 @@ class ModelManager:
                             backend = Backend(spec=spec, port=port)
                             self._backends[spec.name] = backend
                         else:
+                            backend.spec = spec
                             backend.port = port
                         backend.generation += 1
                         backend.state = BackendState.LOADING
@@ -538,9 +421,7 @@ class ModelManager:
         return {
             "status": "ok" if not stopping else "stopping",
             "service": "vllm-model-router",
-            "loaded_model": (
-                self.catalog.default.name if self.catalog.default.name in ready else (ready[0] if ready else None)
-            ),
+            "loaded_model": ready[0] if ready else None,
             "loaded_models": ready,
             "active_requests": active_requests,
             "models": [spec.name for spec in self.catalog.specs],
@@ -698,8 +579,9 @@ class ModelManager:
         if not PortAllocator._is_available(backend.port):
             raise PortUnavailable(f"backend port {backend.port} for model {backend.spec.name!r} became unavailable")
 
-        model_path = await asyncio.to_thread(resolve_model_path, backend.spec)
-        command = self._command(backend.spec, model_path, backend.port)
+        if not await asyncio.to_thread(os.path.isdir, backend.spec.model_path):
+            raise FileNotFoundError(f"model files for {backend.spec.name!r} do not exist: {backend.spec.model_path}")
+        command = self._command(backend.spec, backend.port)
         LOGGER.info("starting vLLM backend for %s: %s", backend.spec.name, " ".join(command))
         env = os.environ.copy()
         cuda_home = os.getenv("CUDA_HOME", "/usr/local/cuda")
@@ -771,95 +653,40 @@ class ModelManager:
             f"timed out after {self.startup_timeout:.0f}s waiting for vLLM backend {backend.spec.name!r} ({last_error})"
         )
 
-    def _command(self, spec: ModelSpec, model_path: str, port: int) -> list[str]:
-        self._validate_extra_args(spec.vllm_args, f"vLLM arguments for model {spec.name!r}")
-        context_length = self.context_length_override or spec.context_length
-        tp_size = self.tensor_parallel_size or spec.tensor_parallel_size or 1
-        dp_size = self.data_parallel_size or spec.data_parallel_size or 1
-        gpu_mem = (
-            self.gpu_memory_utilization
-            if self.gpu_memory_utilization is not None
-            else (spec.gpu_memory_utilization if spec.gpu_memory_utilization is not None else 0.90)
-        )
-        max_requests = (
-            self.max_num_seqs
-            if self.max_num_seqs is not None
-            else (spec.max_num_seqs if spec.max_num_seqs is not None else 256)
-        )
-        batched_tokens = (
-            self.max_num_batched_tokens
-            if self.max_num_batched_tokens is not None
-            else (spec.max_num_batched_tokens if spec.max_num_batched_tokens is not None else 4096)
-        )
-
+    def _command(self, spec: ModelSpec, port: int) -> list[str]:
         command = [
             sys.executable,
             "-m",
             "vllm.entrypoints.openai.api_server",
             "--model",
-            model_path,
+            spec.model_path,
             "--host",
             "127.0.0.1",
             "--port",
             str(port),
             "--served-model-name",
             spec.name,
-            "--tensor-parallel-size",
-            str(tp_size),
-            "--data-parallel-size",
-            str(dp_size),
-            "--gpu-memory-utilization",
-            str(gpu_mem),
             "--max-num-seqs",
-            str(max_requests),
+            str(MAX_NUM_SEQS),
             "--max-num-batched-tokens",
-            str(batched_tokens),
+            str(MAX_NUM_BATCHED_TOKENS),
+            "--kv-cache-dtype",
+            KV_CACHE_DTYPE,
+            "--max-model-len",
+            str(spec.context_length),
+            "--attention-backend",
+            ATTENTION_BACKEND,
+            "--async-scheduling",
+            "--enable-flashinfer-autotune",
+            "--enable-prefix-caching",
         ]
-        command.extend(("--kv-cache-dtype", spec.kv_cache_dtype or "auto"))
-        if context_length:
-            command.extend(("--max-model-len", str(context_length)))
         if spec.reasoning_parser:
             command.extend(("--reasoning-parser", spec.reasoning_parser))
         if spec.tool_call_parser:
             command.extend(("--enable-auto-tool-choice", "--tool-call-parser", spec.tool_call_parser))
-        if spec.chat_template:
-            command.extend(("--chat-template", spec.chat_template))
-        attention_backend = self.attention_backend or spec.attention_backend
-        if attention_backend:
-            command.extend(("--attention-backend", attention_backend))
-        if spec.device_ids is not None:
-            command.extend(("--device-ids", ",".join(str(device) for device in spec.device_ids)))
-        if spec.async_scheduling is not None:
-            command.append("--async-scheduling" if spec.async_scheduling else "--no-async-scheduling")
-        if spec.flashinfer_autotune is not None:
-            command.append(
-                "--enable-flashinfer-autotune" if spec.flashinfer_autotune else "--no-enable-flashinfer-autotune"
-            )
-        if spec.enable_prefix_caching is not None:
-            command.append("--enable-prefix-caching" if spec.enable_prefix_caching else "--no-enable-prefix-caching")
-        if spec.speculative_method is not None:
-            speculative_config: dict[str, Any] = {"method": spec.speculative_method}
-            if spec.num_speculative_tokens is not None:
-                speculative_config["num_speculative_tokens"] = spec.num_speculative_tokens
+        if spec.mtp:
+            speculative_config = {"method": "mtp", "num_speculative_tokens": NUM_SPECULATIVE_TOKENS}
             command.extend(("--speculative-config", json.dumps(speculative_config)))
-
-        override_args: dict[str, Any] = {}
-        if spec.rope_scaling or spec.rope_scale is not None or spec.yarn_orig_ctx is not None:
-            rope_dict: dict[str, Any] = {}
-            if spec.rope_scaling:
-                rope_dict["rope_type"] = spec.rope_scaling.lower()
-            if spec.rope_scale is not None:
-                rope_dict["factor"] = spec.rope_scale
-            if spec.yarn_orig_ctx is not None:
-                rope_dict["original_max_position_embeddings"] = spec.yarn_orig_ctx
-            override_args["rope_scaling"] = rope_dict
-        if spec.rope_theta is not None:
-            override_args["rope_theta"] = spec.rope_theta
-        if override_args:
-            command.extend(("--hf-overrides", json.dumps(override_args)))
-
-        command.extend(spec.vllm_args)
-        command.extend(self.vllm_args)
         return command
 
     async def _drain_and_stop(
@@ -967,27 +794,18 @@ class ModelManager:
         finally:
             await self._finish_output(backend, process)
 
-    def _idle_threshold(self, spec: ModelSpec) -> float:
-        if self.idle_seconds > 0:
-            return self.idle_seconds
-        return spec.idle_seconds or 0.0
-
     async def _idle_reaper(self) -> None:
         while True:
-            thresholds = [threshold for spec in self.catalog.specs if (threshold := self._idle_threshold(spec)) > 0]
-            minimum = min(thresholds) if thresholds else 60.0
-            await asyncio.sleep(min(max(minimum / 2.0, 1.0), 60.0))
+            await asyncio.sleep(min(max(self.idle_seconds / 2.0, 1.0), 60.0))
 
             async with self._lock:
                 now = time.monotonic()
                 tasks: list[asyncio.Task[None]] = []
                 for backend in self._backends.values():
-                    threshold = self._idle_threshold(backend.spec)
                     if (
                         backend.state is BackendState.READY
                         and backend.active_requests == 0
-                        and threshold > 0
-                        and now - backend.last_used >= threshold
+                        and now - backend.last_used >= self.idle_seconds
                     ):
                         backend.state = BackendState.DRAINING
                         backend.stop_task = asyncio.create_task(

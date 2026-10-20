@@ -2,16 +2,15 @@ from __future__ import annotations
 
 import json
 import logging
-from collections.abc import AsyncIterator, Iterable
+from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
-from pathlib import Path
 from uuid import uuid4
 
 import httpx
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse, Response, StreamingResponse
 
-from .catalog import ModelCatalog, ModelSpec
+from .catalog import ModelCatalog
 from .manager import (
     BackendBusyError,
     CapacityError,
@@ -41,17 +40,8 @@ HOP_BY_HOP_HEADERS = {
 PROXY_METHODS = ["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"]
 
 
-def _apply_model_defaults(payload: dict[str, object], spec: ModelSpec) -> None:
-    """Translate catalog request defaults into vLLM request options."""
-
-    if spec.reasoning != "off" or not isinstance(payload.get("messages"), list):
-        return
-    chat_template_kwargs = payload.get("chat_template_kwargs")
-    if chat_template_kwargs is None:
-        chat_template_kwargs = {}
-        payload["chat_template_kwargs"] = chat_template_kwargs
-    if isinstance(chat_template_kwargs, dict):
-        chat_template_kwargs.setdefault("enable_thinking", False)
+def _invalid_request(message: str) -> JSONResponse:
+    return JSONResponse(status_code=400, content={"error": {"message": message, "type": "invalid_request_error"}})
 
 
 def _forward_headers(headers: httpx.Headers) -> dict[str, str]:
@@ -78,22 +68,11 @@ def _backend_error(exc: BaseException) -> JSONResponse:
     )
 
 
-def create_app(
-    catalog: ModelCatalog,
-    manager: ModelManager,
-    *,
-    preload_model: str | Iterable[str] | None = None,
-    default_model: str | None = None,
-    pinned_default: bool = False,
-    catalog_path: str | Path | None = None,
-) -> FastAPI:
-    request_default = catalog.canonicalize(default_model)
-    config_path = Path(catalog_path).expanduser().resolve() if catalog_path is not None else None
-
+def create_app(catalog: ModelCatalog, manager: ModelManager) -> FastAPI:
     @asynccontextmanager
     async def lifespan(_: FastAPI):
         try:
-            await manager.start(preload_model)
+            await manager.start()
             yield
         finally:
             await manager.shutdown()
@@ -151,39 +130,6 @@ def create_app(
             LOGGER.exception("failed to load model %s", model_id)
             return _backend_error(exc)
 
-    @app.post("/admin/reload")
-    async def reload_config() -> JSONResponse:
-        if config_path is None:
-            return JSONResponse(
-                status_code=400,
-                content={
-                    "error": {
-                        "message": "no config file was configured for this service",
-                        "type": "invalid_request_error",
-                    }
-                },
-            )
-        try:
-            new_catalog = ModelCatalog.from_file(config_path)
-        except (OSError, ValueError) as exc:
-            LOGGER.warning("config reload from %s failed, keeping current config: %s", config_path, exc)
-            return JSONResponse(
-                status_code=400,
-                content={"error": {"message": f"failed to load configuration: {exc}", "type": "invalid_request_error"}},
-            )
-        try:
-            result = await manager.reload_catalog(new_catalog)
-        except RuntimeError as exc:
-            return JSONResponse(
-                status_code=503,
-                content={"error": {"message": str(exc), "type": "backend_unavailable"}},
-            )
-        nonlocal request_default
-        app.state.catalog = manager.catalog
-        if not pinned_default:
-            request_default = manager.catalog.default.name
-        return JSONResponse(content=result)
-
     @app.post("/admin/models/{model_id:path}/unload")
     async def unload_model(model_id: str) -> JSONResponse:
         try:
@@ -216,32 +162,21 @@ def create_app(
             try:
                 decoded = json.loads(body)
             except json.JSONDecodeError as exc:
-                return JSONResponse(
-                    status_code=400,
-                    content={"error": {"message": f"invalid JSON body: {exc.msg}", "type": "invalid_request_error"}},
-                )
+                return _invalid_request(f"invalid JSON body: {exc.msg}")
             if isinstance(decoded, dict):
                 payload = decoded
-                if "model" in decoded and decoded["model"] is not None:
-                    if not isinstance(decoded["model"], str):
-                        return JSONResponse(
-                            status_code=400,
-                            content={"error": {"message": "model must be a string", "type": "invalid_request_error"}},
-                        )
-                    raw_model = decoded["model"].strip()
-                    model_name = raw_model or request_default
-                else:
-                    model_name = request_default
-                decoded["model"] = model_name
+                raw_model = decoded.get("model")
+                if raw_model is not None and not isinstance(raw_model, str):
+                    return _invalid_request("model must be a string")
+                model_name = raw_model.strip() if raw_model else None
 
-        if not model_name or not str(model_name).strip():
-            model_name = request_default
+        if not model_name:
+            return _invalid_request("model is required and must be one of your aliases")
 
         try:
             spec = app.state.catalog.get(model_name)
             if payload is not None:
                 payload["model"] = spec.name
-                _apply_model_defaults(payload, spec)
                 outgoing_body = json.dumps(payload, separators=(",", ":")).encode()
             lease = await manager.acquire(spec.name)
         except KeyError as exc:

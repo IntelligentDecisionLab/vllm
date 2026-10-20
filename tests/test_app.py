@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import json
-from pathlib import Path
 from typing import Any
 
 import httpx
@@ -42,7 +41,7 @@ class FakeManager:
         self.sent: list[tuple[str, str, dict[str, Any]]] = []
         self.busy: set[str] = set()
 
-    async def start(self, preload=None) -> None:
+    async def start(self) -> None:
         return None
 
     async def shutdown(self) -> None:
@@ -120,59 +119,16 @@ class FakeManager:
             "error": None,
         }
 
-    async def reload_catalog(self, new_catalog: ModelCatalog) -> dict[str, Any]:
-        old_names = {spec.name for spec in self.catalog.specs}
-        new_names = {spec.name for spec in new_catalog.specs}
-        added = sorted(new_names - old_names)
-        removed = sorted(old_names - new_names)
-        self.catalog = new_catalog
-        for spec in new_catalog.specs:
-            if spec.name not in self.backends:
-                self.backends[spec.name] = Backend(
-                    spec=spec,
-                    port=31000 + len(self.backends),
-                    state=BackendState.READY,
-                    process=AliveProcess(),  # type: ignore[arg-type]
-                )
-        for name in removed:
-            self.backends.pop(name, None)
-        return {
-            "reloaded": True,
-            "config_file": str(new_catalog.config_file),
-            "default_model": new_catalog.default.name,
-            "added": added,
-            "removed": removed,
-            "updated": [],
-            "kept_loaded": sorted(set(self.backends) - set(added)),
-        }
 
-
-def write_catalog_toml(path: Path, entries: dict[str, str], default: str | None = None) -> None:
-    lines: list[str] = []
-    for name, model_path in entries.items():
-        lines.extend((f'["{name}"]', f'model_path = "{model_path}"'))
-        if name == default:
-            lines.append("default = true")
-        lines.append("")
-    path.write_text("\n".join(lines), encoding="utf-8")
-
-
-def make_app(
-    default_model: str | None = None,
-    *,
-    catalog_path: Path | None = None,
-) -> tuple[TestClient, FakeManager]:
+def make_app() -> tuple[TestClient, FakeManager]:
     catalog = ModelCatalog(
         [
-            ModelSpec(name="model-a", model_path="org/a", aliases=("a",)),
-            ModelSpec(name="model-b", model_path="org/b", aliases=("b",), reasoning="off"),
-        ],
-        Path("models.toml"),
+            ModelSpec(name="model-a", model_path="/m/a", repo_id="org/a", context_length=4096),
+            ModelSpec(name="model-b", model_path="/m/b", repo_id="org/b", context_length=8192),
+        ]
     )
     manager = FakeManager(catalog)
-    app = create_app(  # type: ignore[arg-type]
-        catalog, manager, default_model=default_model, catalog_path=catalog_path
-    )
+    app = create_app(catalog, manager)  # type: ignore[arg-type]
     return TestClient(app), manager
 
 
@@ -181,11 +137,11 @@ def test_proxy_routes_each_model_to_its_resident_backend() -> None:
     with client:
         response_a = client.post(
             "/v1/chat/completions",
-            json={"model": "a", "messages": [{"role": "user", "content": "A"}]},
+            json={"model": "model-a", "messages": [{"role": "user", "content": "A"}]},
         )
         response_b = client.post(
             "/v1/chat/completions",
-            json={"model": "b", "messages": [{"role": "user", "content": "B"}]},
+            json={"model": "model-b", "messages": [{"role": "user", "content": "B"}]},
         )
 
     assert response_a.json() == {"backend": "model-a", "model": "model-a"}
@@ -194,22 +150,8 @@ def test_proxy_routes_each_model_to_its_resident_backend() -> None:
     assert manager.sent[0][2]["model"] == "model-a"
     assert manager.sent[1][0] == "model-b"
     assert manager.sent[1][2]["model"] == "model-b"
-    assert manager.sent[1][2]["chat_template_kwargs"] == {"enable_thinking": False}
     assert all(backend.active_requests == 0 for backend in manager.backends.values())
     assert "server" not in response_a.headers
-
-
-def test_configured_default_model_routes_requests_without_model() -> None:
-    client, manager = make_app(default_model="model-b")
-    with client:
-        response = client.post(
-            "/v1/chat/completions",
-            json={"messages": [{"role": "user", "content": "default"}]},
-        )
-
-    assert response.status_code == 200
-    assert response.json()["backend"] == "model-b"
-    assert manager.sent[0][2]["model"] == "model-b"
 
 
 def test_streaming_response_releases_lease() -> None:
@@ -246,7 +188,7 @@ def test_unknown_admin_routes_do_not_proxy() -> None:
         assert public.get("/health").status_code == 200
         assert public.get("/ready").status_code == 200
         assert public.get("/v1/models").status_code == 200
-        assert public.post("/v1/chat/completions", json={"model": "a", "messages": []}).status_code == 200
+        assert public.post("/v1/chat/completions", json={"model": "model-a", "messages": []}).status_code == 200
         for path in ("/admin/not-an-operation", "/Admin/models", "http://testserver//admin/models"):
             assert public.post(path).status_code == 404
     assert [path for _, path, _ in manager.sent] == ["v1/chat/completions"]
@@ -256,10 +198,10 @@ def test_local_management_load_and_unload() -> None:
     client, manager = make_app()
     with client:
         listed = client.get("/admin/models")
-        loaded = client.post("/admin/models/a/load")
-        unloaded = client.post("/admin/models/a/unload")
+        loaded = client.post("/admin/models/model-a/load")
+        unloaded = client.post("/admin/models/model-a/unload")
         manager.busy.add("model-b")
-        busy = client.post("/admin/models/b/unload")
+        busy = client.post("/admin/models/model-b/unload")
 
     assert listed.status_code == 200
     assert loaded.status_code == 200
@@ -268,86 +210,6 @@ def test_local_management_load_and_unload() -> None:
     assert unloaded.json()["unloaded"] is True
     assert busy.status_code == 409
     assert busy.json()["error"]["type"] == "model_busy"
-
-
-def test_admin_reload_swaps_catalog_and_routes_to_new_model(tmp_path: Path) -> None:
-    config = tmp_path / "models.toml"
-    write_catalog_toml(config, {"model-a": "org/a", "model-b": "org/b"})
-    client, manager = make_app(catalog_path=config)
-    with client:
-        write_catalog_toml(config, {"model-a": "org/a", "model-c": "org/c"})
-        response = client.post("/admin/reload")
-
-    assert response.status_code == 200
-    body = response.json()
-    assert body["reloaded"] is True
-    assert body["added"] == ["model-c"]
-    assert body["removed"] == ["model-b"]
-
-    listed = client.get("/v1/models")
-    assert {item["id"] for item in listed.json()["data"]} == {"model-a", "model-c"}
-
-    routed = client.post(
-        "/v1/chat/completions",
-        json={"model": "model-c", "messages": [{"role": "user", "content": "C"}]},
-    )
-    assert routed.json() == {"backend": "model-c", "model": "model-c"}
-
-
-def test_admin_reload_updates_default_model(tmp_path: Path) -> None:
-    config = tmp_path / "models.toml"
-    write_catalog_toml(config, {"model-a": "org/a", "model-b": "org/b"})
-    client, manager = make_app(catalog_path=config)
-    with client:
-        fallback = client.post(
-            "/v1/chat/completions",
-            json={"messages": [{"role": "user", "content": "first"}]},
-        )
-        assert fallback.json()["backend"] == "model-a"
-
-        write_catalog_toml(
-            config,
-            {"model-a": "org/a", "model-b": "org/b"},
-            default="model-b",
-        )
-        reloaded = client.post("/admin/reload")
-        rerouted = client.post(
-            "/v1/chat/completions",
-            json={"messages": [{"role": "user", "content": "second"}]},
-        )
-
-    assert reloaded.status_code == 200
-    assert reloaded.json()["default_model"] == "model-b"
-    assert rerouted.json()["backend"] == "model-b"
-
-
-def test_admin_reload_with_invalid_config_keeps_serving(tmp_path: Path) -> None:
-    config = tmp_path / "models.toml"
-    write_catalog_toml(config, {"model-a": "org/a"})
-    client, manager = make_app(catalog_path=config)
-    with client:
-        config.write_text("this is not [ valid toml", encoding="utf-8")
-        failed = client.post("/admin/reload")
-        listed = client.get("/v1/models")
-        routed = client.post(
-            "/v1/chat/completions",
-            json={"model": "model-a", "messages": []},
-        )
-
-    assert failed.status_code == 400
-    assert "failed to load configuration" in failed.json()["error"]["message"]
-    # Old catalog is untouched and still serving.
-    assert {item["id"] for item in listed.json()["data"]} == {spec.name for spec in manager.catalog.specs}
-    assert routed.status_code == 200
-
-
-def test_admin_reload_without_config_file_returns_400() -> None:
-    client, _ = make_app()
-    with client:
-        response = client.post("/admin/reload")
-
-    assert response.status_code == 400
-    assert response.json()["error"]["type"] == "invalid_request_error"
 
 
 def test_load_and_proxy_share_diagnostic(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -360,8 +222,8 @@ def test_load_and_proxy_share_diagnostic(monkeypatch: pytest.MonkeyPatch) -> Non
     monkeypatch.setattr(manager, "load", failed)
     monkeypatch.setattr(manager, "acquire", failed)
     with client:
-        admin = client.post("/admin/models/a/load")
-        public = client.post("/v1/chat/completions", json={"model": "a", "messages": []})
+        admin = client.post("/admin/models/model-a/load")
+        public = client.post("/v1/chat/completions", json={"model": "model-a", "messages": []})
     assert admin.status_code == public.status_code == 503
     assert admin.json()["error"] == {"type": "backend_unavailable", **diagnostic.as_dict()}
     assert public.json()["error"] == admin.json()["error"]
@@ -382,7 +244,7 @@ def test_generic_startup_errors_never_echo_internal_text(
     monkeypatch.setattr(manager, "load", failed)
     monkeypatch.setattr(manager, "acquire", failed)
     with client:
-        for path, body in (("/admin/models/a/load", None), ("/v1/chat/completions", {"model": "a"})):
+        for path, body in (("/admin/models/model-a/load", None), ("/v1/chat/completions", {"model": "model-a"})):
             response = client.post(path, json=body)
             assert response.status_code == 503
             assert len(response.json()["error"]["diagnostic_id"]) == 32
@@ -420,10 +282,73 @@ def test_proxy_transport_failure_is_safe_and_releases_lease(monkeypatch: pytest.
 
     monkeypatch.setattr(manager, "send", send)
     with client:
-        response = client.post("/v1/chat/completions", json={"model": "a"})
+        response = client.post("/v1/chat/completions", json={"model": "model-a"})
     assert response.status_code == 502
     assert response.json()["error"]["code"] == "backend_request_failed"
     assert len(response.json()["error"]["diagnostic_id"]) == 32
     assert "secret" not in response.text
     assert "127.0.0.1" not in response.text
+    assert manager.backends["model-a"].active_requests == 0
+
+
+def test_missing_or_blank_model_is_rejected() -> None:
+    client, manager = make_app()
+    with client:
+        for body in ({"messages": []}, {"model": None}, {"model": "  "}):
+            response = client.post("/v1/chat/completions", json=body)
+            assert response.status_code == 400
+            assert "model is required" in response.json()["error"]["message"]
+        assert (
+            client.post("/v1/chat/completions", content=b"x", headers={"content-type": "text/plain"}).status_code == 400
+        )
+    assert manager.sent == []
+
+
+def test_invalid_json_and_non_string_model_are_rejected() -> None:
+    client, _ = make_app()
+    with client:
+        bad = client.post("/v1/chat/completions", content=b"{bad-json", headers={"content-type": "application/json"})
+        assert bad.status_code == 400
+        assert bad.json()["error"]["message"].startswith("invalid JSON body")
+        for invalid_model in (12345, 0, False, True, ["model-a"], {"name": "model-a"}):
+            response = client.post("/v1/chat/completions", json={"model": invalid_model})
+            assert response.status_code == 400
+            assert response.json()["error"]["message"] == "model must be a string"
+
+
+def test_only_exact_aliases_route() -> None:
+    client, manager = make_app()
+    with client:
+        for name in ("org/a", "Model-A", "unknown"):
+            response = client.post("/v1/chat/completions", json={"model": name})
+            assert response.status_code == 404
+            assert f"unknown model {name!r}" in response.json()["error"]["message"]
+    assert manager.sent == []
+
+
+def test_get_single_model() -> None:
+    client, _ = make_app()
+    with client:
+        found = client.get("/v1/models/model-a")
+        missing = client.get("/v1/models/nonexistent")
+
+    assert found.status_code == 200
+    assert found.json()["id"] == "model-a"
+    assert found.json()["loaded"] is True
+    assert found.json()["metadata"] == {"repo_id": "org/a", "context_length": 4096}
+    assert missing.status_code == 404
+    assert "unknown model 'nonexistent'" in missing.json()["error"]["message"]
+
+
+def test_unhandled_proxy_error_releases_lease(monkeypatch: pytest.MonkeyPatch) -> None:
+    client, manager = make_app()
+
+    async def crash(*args: object, **kwargs: object) -> httpx.Response:
+        raise RuntimeError("unexpected fatal crash")
+
+    monkeypatch.setattr(manager, "send", crash)
+    with TestClient(client.app, raise_server_exceptions=False) as raw:
+        response = raw.post("/v1/chat/completions", json={"model": "model-a"})
+
+    assert response.status_code == 500
     assert manager.backends["model-a"].active_requests == 0

@@ -1,109 +1,230 @@
 from __future__ import annotations
 
+import json
+import logging
 import os
-import tomllib
+import re
+import struct
 from collections.abc import Iterable
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+LOGGER = logging.getLogger("vllm_gateway")
 
-def _truthy(value: Any) -> bool:
-    if isinstance(value, bool):
-        return value
-    if isinstance(value, (int, float)):
-        return value != 0
-    return str(value or "").strip().lower() in {"1", "true", "yes", "on"}
+ALIAS_PATTERN = re.compile(r"^[A-Za-z0-9._-]{1,64}$")
+MIN_CONTEXT_LENGTH = 1024
+_MAX_SAFETENSORS_HEADER = 100 * 1024 * 1024
+_MODEL_ARCHITECTURE_SUFFIXES = ("ForCausalLM", "ForConditionalGeneration")
+_QWEN3_HYBRID = re.compile(r"^qwen3_(?:\d+|next)")
 
 
-def _int_or_none(value: Any) -> int | None:
-    if value is None:
+@dataclass(frozen=True, slots=True)
+class FamilyProfile:
+    """Parsers that vLLM needs for a model family."""
+
+    reasoning_parser: str | None = None
+    tool_call_parser: str | None = None
+
+
+def profile_for(model_types: Iterable[str]) -> FamilyProfile:
+    for model_type in model_types:
+        if _QWEN3_HYBRID.match(model_type):
+            return FamilyProfile("qwen3", "qwen3_coder")
+        if model_type in {"qwen3", "qwen3_moe"}:
+            return FamilyProfile("qwen3", "hermes")
+    return FamilyProfile()
+
+
+@dataclass(frozen=True, slots=True)
+class ModelInfo:
+    """A complete, loadable model snapshot found in the Hugging Face cache."""
+
+    repo_id: str
+    snapshot: Path
+    model_types: tuple[str, ...]
+    max_context: int
+    weights_bytes: int
+    kv_bytes_per_token: int
+    mtp: bool
+
+    @property
+    def profile(self) -> FamilyProfile:
+        return profile_for(self.model_types)
+
+    def as_dict(self) -> dict[str, object]:
+        profile = self.profile
+        return {
+            "repo_id": self.repo_id,
+            "size_bytes": self.weights_bytes,
+            "max_context": self.max_context,
+            "kv_bytes_per_token": self.kv_bytes_per_token,
+            "mtp": self.mtp,
+            "reasoning_parser": profile.reasoning_parser,
+            "tool_call_parser": profile.tool_call_parser,
+        }
+
+
+def _safetensors_keys(path: Path) -> set[str]:
+    with open(path, "rb") as f:
+        (length,) = struct.unpack("<Q", f.read(8))
+        if length > _MAX_SAFETENSORS_HEADER:
+            raise ValueError(f"safetensors header is too large: {path}")
+        header = json.loads(f.read(length))
+    return {key for key in header if key != "__metadata__"}
+
+
+def _weights(snapshot: Path) -> tuple[list[Path], set[str]] | None:
+    """Return weight files and tensor names, or None when the snapshot is incomplete."""
+
+    index = snapshot / "model.safetensors.index.json"
+    if index.is_file():
+        weight_map = json.loads(index.read_text(encoding="utf-8"))["weight_map"]
+        paths = [snapshot / name for name in sorted(set(weight_map.values()))]
+        if not paths or not all(path.exists() for path in paths):
+            return None
+        return paths, set(weight_map)
+    paths = sorted(snapshot.glob("*.safetensors"))
+    if not paths:
         return None
-    if isinstance(value, int):
-        return value
-    if isinstance(value, float):
-        return int(value)
-    if isinstance(value, str):
-        s = value.strip()
-        return int(s) if s else None
-    return None
+    keys: set[str] = set()
+    for path in paths:
+        keys |= _safetensors_keys(path)
+    return paths, keys
 
 
-def _float_or_none(value: Any) -> float | None:
-    if value is None:
+def _positive_int(value: Any) -> int:
+    return value if isinstance(value, int) and not isinstance(value, bool) and value > 0 else 0
+
+
+def inspect_snapshot(repo_id: str, snapshot: Path) -> ModelInfo | None:
+    """Read a snapshot's config and weights. Return None when it cannot be served."""
+
+    if any((snapshot.parent.parent / "blobs").glob("*.incomplete")):
         return None
-    if isinstance(value, (int, float)):
-        return float(value)
-    if isinstance(value, str):
-        s = value.strip()
-        return float(s) if s else None
+    config_file = snapshot / "config.json"
+    if not config_file.is_file():
+        return None
+    config = json.loads(config_file.read_text(encoding="utf-8"))
+    architectures = config.get("architectures") or []
+    if not any(str(name).endswith(_MODEL_ARCHITECTURE_SUFFIXES) for name in architectures):
+        return None
+    weights = _weights(snapshot)
+    if weights is None:
+        return None
+    paths, keys = weights
 
+    text = config.get("text_config") if isinstance(config.get("text_config"), dict) else config
+    max_context = _positive_int(text.get("max_position_embeddings")) or _positive_int(
+        config.get("max_position_embeddings")
+    )
+    layers = _positive_int(text.get("num_hidden_layers"))
+    heads = _positive_int(text.get("num_attention_heads"))
+    kv_heads = _positive_int(text.get("num_key_value_heads")) or heads
+    hidden = _positive_int(text.get("hidden_size"))
+    head_dim = _positive_int(text.get("head_dim")) or (hidden // heads if heads else 0)
+    if not (max_context and layers and kv_heads and head_dim):
+        return None
 
-def _parse_kv_cache_dtype(
-    cache_k: str | None = None,
-    cache_v: str | None = None,
-    explicit_dtype: str | None = None,
-) -> str | None:
-    if explicit_dtype and str(explicit_dtype).strip():
-        dtype = str(explicit_dtype).strip().lower().replace("-", "_")
+    layer_types = text.get("layer_types")
+    interval = _positive_int(text.get("full_attention_interval"))
+    if isinstance(layer_types, list):
+        full_layers = sum(item == "full_attention" for item in layer_types)
+    elif interval:
+        full_layers = layers // interval
     else:
-        dtype = (cache_k or cache_v or "").strip().lower().replace("-", "_")
-    if not dtype:
+        full_layers = layers
+
+    mtp_layers = _positive_int(text.get("mtp_num_hidden_layers")) or _positive_int(text.get("num_nextn_predict_layers"))
+    mtp = bool(mtp_layers) and any(key.startswith("mtp.") or ".mtp." in key for key in keys)
+    if mtp:
+        full_layers += mtp_layers
+
+    model_types = tuple(
+        str(item) for item in (config.get("model_type"), text.get("model_type")) if isinstance(item, str) and item
+    )
+    return ModelInfo(
+        repo_id=repo_id,
+        snapshot=snapshot.resolve(),
+        model_types=model_types,
+        max_context=max_context,
+        weights_bytes=sum(path.stat().st_size for path in paths),
+        kv_bytes_per_token=2 * full_layers * kv_heads * head_dim,
+        mtp=mtp,
+    )
+
+
+def _snapshot_dir(repo_dir: Path) -> Path | None:
+    snapshots = repo_dir / "snapshots"
+    ref = repo_dir / "refs" / "main"
+    if ref.is_file():
+        candidate = snapshots / ref.read_text(encoding="utf-8").strip()
+        if candidate.is_dir():
+            return candidate
+    if not snapshots.is_dir():
         return None
-    if dtype in {"q8_0", "q8", "fp8", "fp8_e5m2"}:
-        return "fp8_e5m2"
-    if dtype in {"fp8_e4m3"}:
-        return "fp8_e4m3"
-    if dtype in {"fp4", "fp4_e2m1", "q4_0"}:
-        return "fp4_e2m1"
-    if dtype in {"bf16", "bfloat16"}:
-        return "bfloat16"
-    if dtype in {"fp16", "f16", "auto"}:
-        return "auto"
-    return dtype
+    candidates = [item for item in snapshots.iterdir() if item.is_dir()]
+    return max(candidates, key=lambda item: item.stat().st_mtime, default=None)
+
+
+def _inspect_repo(repo_dir: Path) -> ModelInfo | None:
+    snapshot = _snapshot_dir(repo_dir)
+    if snapshot is None:
+        return None
+    repo_id = repo_dir.name.removeprefix("models--").replace("--", "/")
+    return inspect_snapshot(repo_id, snapshot)
+
+
+def _repo_dir(hub_cache: Path, repo_id: str) -> Path:
+    return hub_cache / f"models--{repo_id.replace('/', '--')}"
+
+
+def find_local_model(hub_cache: Path, repo_id: str) -> ModelInfo | None:
+    try:
+        return _inspect_repo(_repo_dir(hub_cache, repo_id))
+    except (OSError, ValueError, KeyError, TypeError, AttributeError) as exc:
+        LOGGER.warning("cannot inspect %s in %s: %s", repo_id, hub_cache, exc)
+        return None
+
+
+def scan_local_models(hub_cache: Path) -> list[ModelInfo]:
+    """List loadable models. Only `models--*` directories are visited and unreadable ones are skipped."""
+
+    try:
+        repo_dirs = sorted(hub_cache.glob("models--*"))
+    except OSError:
+        return []
+    found: list[ModelInfo] = []
+    for repo_dir in repo_dirs:
+        try:
+            info = _inspect_repo(repo_dir)
+        except (OSError, ValueError, KeyError, TypeError, AttributeError) as exc:
+            LOGGER.debug("skipping %s: %s", repo_dir, exc)
+            continue
+        if info is not None:
+            found.append(info)
+    return found
+
+
+def default_hub_cache() -> Path:
+    from huggingface_hub import constants
+
+    return Path(constants.HF_HUB_CACHE)
 
 
 @dataclass(frozen=True, slots=True)
 class ModelSpec:
-    """Specification for a model exposed by the vLLM gateway."""
+    """A user alias bound to one model snapshot and one context length."""
 
     name: str
-    model_path: str = ""
-    hf_repo: str | None = None
+    model_path: str
+    repo_id: str = ""
     context_length: int | None = None
-    kv_cache_dtype: str | None = None
-    tensor_parallel_size: int | None = None
-    data_parallel_size: int | None = None
-    gpu_memory_utilization: float | None = None
-    device_ids: tuple[int, ...] | None = None
-    async_scheduling: bool | None = None
-    flashinfer_autotune: bool | None = None
-    enable_prefix_caching: bool | None = None
-    speculative_method: str | None = None
-    num_speculative_tokens: int | None = None
-    max_num_seqs: int | None = None
-    max_num_batched_tokens: int | None = None
-    reasoning: str | None = None
-    rope_scaling: str | None = None
-    rope_scale: float | None = None
-    yarn_orig_ctx: int | None = None
-    rope_theta: float | None = None
-    idle_seconds: float | None = None
+    weights_bytes: int = 0
+    kv_bytes_per_token: int = 0
     reasoning_parser: str | None = None
     tool_call_parser: str | None = None
-    chat_template: str | None = None
-    attention_backend: str | None = None
-    vllm_args: tuple[str, ...] = ()
-    is_default: bool = False
-    aliases: tuple[str, ...] = ()
-
-    @property
-    def source(self) -> str:
-        return self.model_path or self.hf_repo or ""
-
-    @property
-    def model(self) -> str:
-        return self.source
+    mtp: bool = False
 
     def public_dict(self, loaded: bool = False) -> dict[str, object]:
         return {
@@ -112,260 +233,119 @@ class ModelSpec:
             "owned_by": "local",
             "created": 0,
             "loaded": loaded,
-            "metadata": {
-                "source": self.source,
-                "reasoning": self.reasoning,
-                "kv_cache_dtype": self.kv_cache_dtype,
-                "tensor_parallel_size": self.tensor_parallel_size,
-                "data_parallel_size": self.data_parallel_size,
-                "rope_scaling": self.rope_scaling,
-                "rope_scale": self.rope_scale,
-                "yarn_orig_ctx": self.yarn_orig_ctx,
-            },
+            "metadata": {"repo_id": self.repo_id, "context_length": self.context_length},
         }
+
+
+def _spec_from_info(alias: str, info: ModelInfo, context_length: int) -> ModelSpec:
+    profile = info.profile
+    return ModelSpec(
+        name=alias,
+        model_path=str(info.snapshot),
+        repo_id=info.repo_id,
+        context_length=context_length,
+        weights_bytes=info.weights_bytes,
+        kv_bytes_per_token=info.kv_bytes_per_token,
+        reasoning_parser=profile.reasoning_parser,
+        tool_call_parser=profile.tool_call_parser,
+        mtp=info.mtp,
+    )
 
 
 class ModelCatalog:
-    def __init__(self, specs: Iterable[ModelSpec], config_file: Path):
-        self._specs = tuple(specs)
-        if not self._specs:
-            raise ValueError(f"no named models found in configuration file: {config_file}")
-        self.config_file = config_file
-        self._by_name: dict[str, ModelSpec] = {}
-        self._by_normalized: dict[str, ModelSpec] = {}
-        self._by_alias: dict[str, ModelSpec] = {}
-        lookup_owners: dict[str, tuple[ModelSpec, str]] = {}
+    """User aliases, persisted to `state_file` and resolved against the Hugging Face cache."""
 
-        def register(value: str, spec: ModelSpec, kind: str, *, canonical: bool = False) -> None:
-            raw = value.strip()
-            if not raw:
-                return
-            normalized = self._normalize(raw)
-            existing = lookup_owners.get(normalized)
-            if existing and existing[0] is not spec:
-                other, other_kind = existing
-                raise ValueError(
-                    f"model lookup collision for {raw!r}: {spec.name!r} ({kind}) "
-                    f"conflicts with {other.name!r} ({other_kind})"
-                )
-            lookup_owners[normalized] = (spec, kind)
-            if canonical:
-                self._by_name[raw] = spec
-                self._by_normalized[normalized] = spec
-            else:
-                self._by_alias[raw] = spec
-                self._by_alias[raw.lower()] = spec
-                self._by_alias[normalized] = spec
-
-        for spec in self._specs:
-            register(spec.name, spec, "canonical name", canonical=True)
-            for alias in spec.aliases:
-                register(alias, spec, "alias")
-            if spec.model_path:
-                register(spec.model_path, spec, "model path")
-            if spec.source:
-                register(spec.source, spec, "source")
-            if spec.hf_repo:
-                register(spec.hf_repo, spec, "Hugging Face repository")
-
-    @staticmethod
-    def _normalize(value: str) -> str:
-        return value.strip().lower().replace("_", "-").replace(".", "-")
+    def __init__(
+        self,
+        specs: Iterable[ModelSpec] = (),
+        *,
+        state_file: Path | None = None,
+        hub_cache: Path | None = None,
+    ):
+        self.state_file = state_file
+        self.hub_cache = hub_cache
+        self._specs: dict[str, ModelSpec] = {}
+        self._unresolved: dict[str, dict[str, Any]] = {}
+        for spec in specs:
+            if spec.name in self._specs:
+                raise ValueError(f"duplicate alias {spec.name!r}")
+            self._specs[spec.name] = spec
 
     @classmethod
-    def from_toml_file(cls, config_file: str | os.PathLike[str]) -> ModelCatalog:
-        path = Path(config_file).expanduser().resolve()
-        if not path.is_file():
-            raise FileNotFoundError(f"configuration file does not exist: {path}")
+    def load(cls, state_file: Path, hub_cache: Path) -> ModelCatalog:
+        catalog = cls(state_file=state_file, hub_cache=hub_cache)
+        if not state_file.is_file():
+            return catalog
+        try:
+            entries = json.loads(state_file.read_text(encoding="utf-8"))["aliases"]
+        except (ValueError, KeyError, TypeError) as exc:
+            raise ValueError(f"invalid alias state file {state_file}: {exc}") from exc
+        for alias, entry in entries.items():
+            try:
+                catalog._specs[alias] = catalog._resolve(alias, entry["repo_id"], entry["context_length"])
+            except (KeyError, ValueError, TypeError) as exc:
+                LOGGER.warning("alias %r is unavailable and kept unloaded: %s", alias, exc)
+                catalog._unresolved[alias] = entry
+        return catalog
 
-        with open(path, "rb") as f:
-            data = tomllib.load(f)
-
-        # Extract common/default properties
-        common: dict[str, Any] = {}
-        for top_k, top_v in data.items():
-            if not isinstance(top_v, dict):
-                common[top_k] = top_v
-
-        default_section = data.get("default") or data.get("global") or data.get("*")
-        if isinstance(default_section, dict):
-            common.update(default_section)
-
-        ignored_common_keys = {
-            "name",
-            "model_path",
-            "hf_repo",
-            "default",
-            "aliases",
-        }
-        common_without_default = {k: v for k, v in common.items() if k not in ignored_common_keys}
-
-        # Collect model dictionaries
-        model_dicts: list[tuple[str, dict[str, Any]]] = []
-        if isinstance(data.get("models"), dict):
-            models_map = data["models"]
-            has_subdicts = any(isinstance(v, dict) for v in models_map.values())
-            if has_subdicts:
-                for m_name, m_val in models_map.items():
-                    if isinstance(m_val, dict):
-                        model_dicts.append((m_name, m_val))
-            elif any(k in models_map for k in ("model_path", "hf_repo")):
-                model_name = str(models_map.get("name") or "default")
-                model_dicts.append((model_name, models_map))
-        elif isinstance(data.get("models"), list):
-            for item in data["models"]:
-                if isinstance(item, dict):
-                    m_name = item.get("name")
-                    if m_name:
-                        model_dicts.append((str(m_name), item))
-
-        for k, v in data.items():
-            if k in {"default", "global", "*", "models"}:
-                continue
-            if isinstance(v, dict):
-                model_dicts.append((k, v))
-
-        if not model_dicts:
-            raise ValueError(f"no models defined in {path}")
-
-        specs: list[ModelSpec] = []
-        for name, values in model_dicts:
-            merged = {**common_without_default, **values}
-            gpu_memory_utilization = values.get("gpu_memory_utilization")
-            if gpu_memory_utilization is None:
-                gpu_memory_utilization = common_without_default.get("gpu_memory_utilization")
-            for key, expected_type in (
-                ("async_scheduling", bool),
-                ("flashinfer_autotune", bool),
-                ("enable_prefix_caching", bool),
-                ("speculative_method", str),
-                ("num_speculative_tokens", int),
-            ):
-                value = merged.get(key)
-                if value is not None and type(value) is not expected_type:
-                    raise ValueError(f"model {name!r}: {key} must be a TOML {expected_type.__name__}")
-            device_ids = merged.get("device_ids")
-            if device_ids is not None and (
-                not isinstance(device_ids, list) or any(type(item) is not int for item in device_ids)
-            ):
-                raise ValueError(f"model {name!r}: device_ids must be a TOML integer array")
-            model_name = str(values.get("name") or name)
-            model_path = merged.get("model_path") or merged.get("hf_repo") or ""
-            hf_repo = merged.get("hf_repo")
-
-            if not model_path and not hf_repo:
-                raise ValueError(f"model entry {model_name!r} has no model_path or hf_repo")
-
-            raw_aliases = merged.get("aliases") or ()
-            if isinstance(raw_aliases, str):
-                aliases = tuple(a.strip() for a in raw_aliases.split(",") if a.strip())
-            elif isinstance(raw_aliases, (list, tuple)):
-                aliases = tuple(str(a).strip() for a in raw_aliases)
-            else:
-                aliases = ()
-
-            raw_vllm_args = merged.get("vllm_args") or ()
-            if isinstance(raw_vllm_args, str):
-                vllm_args = tuple(raw_vllm_args.split())
-            elif isinstance(raw_vllm_args, (list, tuple)):
-                vllm_args = tuple(str(a) for a in raw_vllm_args)
-            else:
-                vllm_args = ()
-
-            reasoning = merged.get("reasoning")
-            if isinstance(reasoning, bool):
-                reasoning = "on" if reasoning else "off"
-            elif reasoning is not None:
-                reasoning = str(reasoning)
-
-            spec = ModelSpec(
-                name=model_name,
-                model_path=str(model_path) if model_path else "",
-                hf_repo=str(hf_repo) if hf_repo else None,
-                context_length=_int_or_none(merged.get("context_length")),
-                kv_cache_dtype=_parse_kv_cache_dtype(explicit_dtype=merged.get("kv_cache_dtype")) or "auto",
-                tensor_parallel_size=_int_or_none(merged.get("tensor_parallel_size")),
-                data_parallel_size=_int_or_none(merged.get("data_parallel_size")),
-                gpu_memory_utilization=_float_or_none(gpu_memory_utilization),
-                device_ids=tuple(device_ids) if device_ids is not None else None,
-                async_scheduling=merged.get("async_scheduling"),
-                flashinfer_autotune=merged.get("flashinfer_autotune"),
-                enable_prefix_caching=merged.get("enable_prefix_caching"),
-                speculative_method=merged.get("speculative_method"),
-                num_speculative_tokens=merged.get("num_speculative_tokens"),
-                max_num_seqs=_int_or_none(merged.get("max_num_seqs")),
-                max_num_batched_tokens=_int_or_none(merged.get("max_num_batched_tokens")),
-                reasoning=reasoning,
-                rope_scaling=merged.get("rope_scaling"),
-                rope_scale=_float_or_none(merged.get("rope_scale")),
-                yarn_orig_ctx=_int_or_none(merged.get("yarn_orig_ctx")),
-                rope_theta=_float_or_none(merged.get("rope_theta")),
-                idle_seconds=_float_or_none(merged.get("idle_seconds")),
-                reasoning_parser=merged.get("reasoning_parser"),
-                tool_call_parser=merged.get("tool_call_parser"),
-                chat_template=merged.get("chat_template"),
-                attention_backend=merged.get("attention_backend"),
-                vllm_args=vllm_args,
-                is_default=_truthy(merged.get("default")),
-                aliases=aliases,
+    def _resolve(self, alias: str, repo_id: str, context_length: object) -> ModelSpec:
+        if not isinstance(alias, str) or not ALIAS_PATTERN.fullmatch(alias):
+            raise ValueError("alias must match [A-Za-z0-9._-]{1,64}")
+        if not isinstance(repo_id, str) or not repo_id.strip():
+            raise ValueError("model must be a Hugging Face repo id")
+        if self.hub_cache is None:
+            raise RuntimeError("catalog has no Hugging Face cache")
+        info = find_local_model(self.hub_cache, repo_id.strip())
+        if info is None:
+            raise KeyError(f"model {repo_id!r} is not available in the local cache")
+        if isinstance(context_length, bool) or not isinstance(context_length, int):
+            raise ValueError("context_length must be an integer")
+        if not MIN_CONTEXT_LENGTH <= context_length <= info.max_context:
+            raise ValueError(
+                f"context_length must be between {MIN_CONTEXT_LENGTH} and {info.max_context} for {info.repo_id}"
             )
-            specs.append(spec)
+        return _spec_from_info(alias, info, context_length)
 
-        return cls(specs, path)
+    def add(self, alias: str, repo_id: str, context_length: object) -> ModelSpec:
+        if alias in self._specs or alias in self._unresolved:
+            raise ValueError(f"alias {alias!r} already exists")
+        spec = self._resolve(alias, repo_id, context_length)
+        self._specs[alias] = spec
+        self._save()
+        return spec
 
-    @classmethod
-    def from_file(cls, config_file: str | os.PathLike[str]) -> ModelCatalog:
-        return cls.from_toml_file(config_file)
+    def remove(self, alias: str) -> ModelSpec:
+        spec = self.get(alias)
+        del self._specs[alias]
+        self._save()
+        return spec
+
+    def _save(self) -> None:
+        if self.state_file is None:
+            return
+        entries = {
+            **self._unresolved,
+            **{
+                name: {"repo_id": spec.repo_id, "context_length": spec.context_length}
+                for name, spec in self._specs.items()
+            },
+        }
+        self.state_file.parent.mkdir(parents=True, exist_ok=True)
+        tmp = self.state_file.with_name(self.state_file.name + ".tmp")
+        tmp.write_text(json.dumps({"aliases": entries}, indent=2), encoding="utf-8")
+        os.replace(tmp, self.state_file)
 
     @property
     def specs(self) -> tuple[ModelSpec, ...]:
-        return self._specs
-
-    @property
-    def default(self) -> ModelSpec:
-        for spec in self._specs:
-            if spec.is_default:
-                return spec
-        return self._specs[0]
+        return tuple(self._specs.values())
 
     def get(self, name: str | None) -> ModelSpec:
-        if not name or not str(name).strip():
-            return self.default
-        name_str = str(name).strip()
-        spec = (
-            self._by_name.get(name_str)
-            or self._by_alias.get(name_str)
-            or self._by_normalized.get(self._normalize(name_str))
-            or self._by_alias.get(self._normalize(name_str))
-        )
+        spec = self._specs.get(name.strip()) if isinstance(name, str) else None
         if spec is None:
-            available = ", ".join(self._by_name)
+            available = ", ".join(self._specs) or "none"
             raise KeyError(f"unknown model {name!r}; available models: {available}")
         return spec
 
-    def canonicalize(self, name: str | None) -> str:
-        return self.get(name).name
-
     def public_models(self, loaded_names: str | Iterable[str] | None = None) -> list[dict[str, object]]:
-        if isinstance(loaded_names, str):
-            loaded = {loaded_names}
-        else:
-            loaded = set(loaded_names or ())
-        return [spec.public_dict(spec.name in loaded) for spec in self._specs]
-
-
-def resolve_model_path(spec: ModelSpec) -> str:
-    """Resolve a model path, preserving Hugging Face repository IDs for vLLM."""
-
-    target = spec.model_path or spec.source
-    if not target:
-        raise ValueError(f"model {spec.name!r} has no source or model_path")
-
-    expanded = Path(os.path.expandvars(target)).expanduser()
-    if expanded.exists():
-        return str(expanded.resolve())
-
-    if target.startswith(("/", "./", "../", "~", "$")) or expanded.is_absolute():
-        raise FileNotFoundError(f"local model for {spec.name!r} does not exist: {expanded}")
-
-    return target
+        loaded = {loaded_names} if isinstance(loaded_names, str) else set(loaded_names or ())
+        return [spec.public_dict(spec.name in loaded) for spec in self._specs.values()]

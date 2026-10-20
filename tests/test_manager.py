@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import socket
 import sys
 from pathlib import Path
@@ -13,13 +14,17 @@ from vllm_gateway.diagnostics import BackendOutput, BackendStartupError
 from vllm_gateway.manager import (
     Backend,
     BackendBusyError,
+    BackendLease,
     BackendState,
+    CapacityError,
     ModelManager,
     PortAllocator,
     PortUnavailable,
 )
 
 pytestmark = pytest.mark.anyio
+
+MODEL_DIR = str(Path(__file__).parent)  # any existing directory satisfies the model files check
 
 
 class FakeProcess:
@@ -44,10 +49,9 @@ class FakeProcess:
 def make_catalog() -> ModelCatalog:
     return ModelCatalog(
         [
-            ModelSpec(name="model-a", model_path="org/model-a", aliases=("a",)),
-            ModelSpec(name="model-b", model_path="org/model-b", aliases=("b",)),
-        ],
-        Path("models.toml"),
+            ModelSpec(name="model-a", model_path=MODEL_DIR, repo_id="org/a", context_length=4096),
+            ModelSpec(name="model-b", model_path=MODEL_DIR, repo_id="org/b", context_length=8192),
+        ]
     )
 
 
@@ -81,7 +85,7 @@ async def test_same_model_concurrent_acquire_starts_once(monkeypatch: pytest.Mon
     gate = asyncio.Event()
     starts = install_fake_processes(monkeypatch, manager, gates={"model-a": gate})
 
-    tasks = [asyncio.create_task(manager.acquire("a")) for _ in range(20)]
+    tasks = [asyncio.create_task(manager.acquire("model-a")) for _ in range(20)]
     while not starts:
         await asyncio.sleep(0)
     assert starts == ["model-a"]
@@ -301,199 +305,6 @@ def test_port_allocator_never_takes_foreign_listener() -> None:
         listener.close()
 
 
-def test_catalog_rejects_normalized_and_alias_collisions() -> None:
-    with pytest.raises(ValueError, match="lookup collision"):
-        ModelCatalog(
-            [
-                ModelSpec(name="model.a", model_path="org/a"),
-                ModelSpec(name="model-a", model_path="org/b"),
-            ],
-            Path("models.toml"),
-        )
-
-    with pytest.raises(ValueError, match="lookup collision"):
-        ModelCatalog(
-            [
-                ModelSpec(name="model-a", model_path="org/a", aliases=("shared",)),
-                ModelSpec(name="model-b", model_path="org/b", aliases=("shared",)),
-            ],
-            Path("models.toml"),
-        )
-
-
-def test_command_rejects_gateway_managed_extra_args() -> None:
-    catalog = ModelCatalog(
-        [
-            ModelSpec(
-                name="model-a",
-                model_path="org/a",
-                vllm_args=("--port=31000",),
-            )
-        ],
-        Path("models.toml"),
-    )
-    manager = ModelManager(catalog)
-    with pytest.raises(ValueError, match="--port"):
-        manager._command(catalog.default, "org/a", 30000)
-
-    underscore_spec = ModelSpec(
-        name="model-b",
-        model_path="org/b",
-        vllm_args=("--tensor_parallel_size=8",),
-    )
-    underscore_manager = ModelManager(ModelCatalog([underscore_spec], Path("models.toml")))
-    with pytest.raises(ValueError, match="--tensor_parallel_size"):
-        underscore_manager._command(underscore_spec, "org/b", 30001)
-
-
-def test_global_idle_timeout_overrides_per_model_zero() -> None:
-    spec = ModelSpec(name="model-a", model_path="org/a", idle_seconds=0.0)
-    manager = ModelManager(ModelCatalog([spec], Path("models.toml")), idle_seconds=60.0)
-    assert manager._idle_threshold(spec) == 60.0
-
-
-def test_command_defaults_to_single_gpu_when_parallelism_is_unspecified() -> None:
-    spec = ModelSpec(name="model-a", model_path="org/a")
-    manager = ModelManager(ModelCatalog([spec], Path("models.toml")))
-    command = manager._command(spec, "org/a", 30000)
-    assert command[command.index("--tensor-parallel-size") + 1] == "1"
-
-
-async def test_reload_keeps_loaded_model_and_adds_new(monkeypatch: pytest.MonkeyPatch) -> None:
-    manager = ModelManager(make_catalog(), max_loaded_models=2, shutdown_timeout=0.1)
-    install_fake_processes(monkeypatch, manager)
-
-    lease = await manager.acquire("model-a")
-    old_process = lease.backend.process
-    new_catalog = ModelCatalog(
-        [
-            ModelSpec(name="model-a", model_path="org/model-a", aliases=("a",)),
-            ModelSpec(name="model-c", model_path="org/model-c"),
-        ],
-        Path("models.toml"),
-    )
-    result = await manager.reload_catalog(new_catalog)
-
-    assert result == {
-        "reloaded": True,
-        "config_file": str(new_catalog.config_file),
-        "default_model": "model-a",
-        "added": ["model-c"],
-        "removed": ["model-b"],
-        "updated": [],
-        "kept_loaded": ["model-a"],
-    }
-    assert manager.catalog is new_catalog
-    assert manager._backends["model-a"].process is old_process
-    health = await manager.health()
-    assert health["models"] == ["model-a", "model-c"]
-
-    await lease.release()
-    await manager.shutdown()
-
-
-async def test_reload_stops_backend_of_removed_model(monkeypatch: pytest.MonkeyPatch) -> None:
-    manager = ModelManager(make_catalog(), max_loaded_models=2, shutdown_timeout=0.1)
-    install_fake_processes(monkeypatch, manager)
-
-    lease = await manager.acquire("model-b")
-    await lease.release()
-    removed_process = manager._backends["model-b"].process
-    assert removed_process is not None and removed_process.returncode is None
-
-    new_catalog = ModelCatalog(
-        [ModelSpec(name="model-a", model_path="org/model-a")],
-        Path("models.toml"),
-    )
-    result = await manager.reload_catalog(new_catalog)
-
-    assert result["removed"] == ["model-b"]
-    assert "model-b" not in manager._backends
-    assert removed_process is not None and removed_process.returncode == 0
-    with pytest.raises(KeyError):
-        await manager.acquire("model-b")
-    await manager.shutdown()
-
-
-async def test_reload_restarts_updated_model_with_new_spec(monkeypatch: pytest.MonkeyPatch) -> None:
-    manager = ModelManager(make_catalog(), max_loaded_models=2, shutdown_timeout=0.1)
-    starts = install_fake_processes(monkeypatch, manager)
-
-    lease = await manager.acquire("model-a")
-    await lease.release()
-    old_pid = manager._backends["model-a"].process.pid  # type: ignore[union-attr]
-
-    new_catalog = ModelCatalog(
-        [
-            ModelSpec(name="model-a", model_path="org/model-a", aliases=("a",), context_length=8192),
-            ModelSpec(name="model-b", model_path="org/model-b", aliases=("b",)),
-        ],
-        Path("models.toml"),
-    )
-    result = await manager.reload_catalog(new_catalog)
-
-    assert result["updated"] == ["model-a"]
-    assert "model-a" not in manager._backends
-
-    fresh_lease = await manager.acquire("model-a")
-    assert fresh_lease.backend.spec.context_length == 8192
-    assert fresh_lease.backend.process.pid != old_pid  # type: ignore[union-attr]
-    assert starts == ["model-a", "model-a"]
-
-    await fresh_lease.release()
-    await manager.shutdown()
-
-
-async def test_reload_recomputes_default_max_loaded_models_only() -> None:
-    four_models = ModelCatalog(
-        [ModelSpec(name=f"model-{index}", model_path=f"org/model-{index}") for index in range(4)],
-        Path("models.toml"),
-    )
-    one_model = ModelCatalog(
-        [ModelSpec(name="model-a", model_path="org/model-a")],
-        Path("models.toml"),
-    )
-
-    defaulted = ModelManager(four_models)
-    assert defaulted.max_loaded_models == 2
-    await defaulted.reload_catalog(one_model)
-    assert defaulted.max_loaded_models == 1
-    await defaulted.shutdown()
-
-    pinned = ModelManager(four_models, max_loaded_models=4)
-    await pinned.reload_catalog(one_model)
-    assert pinned.max_loaded_models == 4
-    await pinned.shutdown()
-
-
-@pytest.mark.parametrize(
-    "flag",
-    [
-        "device-ids",
-        "async-scheduling",
-        "enable-flashinfer-autotune",
-        "speculative-config",
-        "enable-chunked-prefill",
-        "enable-prefix-caching",
-        "enable-auto-tool-choice",
-    ],
-)
-@pytest.mark.parametrize("spelling", ["hyphen", "underscore", "negated", "negated_underscore"])
-def test_new_managed_flags_reject_all_spellings(flag: str, spelling: str) -> None:
-    if spelling.startswith("negated"):
-        flag = "no-" + flag
-    if "underscore" in spelling:
-        flag = flag.replace("-", "_")
-    argument = f"--{flag}=true"
-    spec = ModelSpec(name="model-a", model_path="org/a", vllm_args=(argument,))
-    catalog = ModelCatalog([spec], Path("models.toml"))
-    manager = ModelManager(catalog)
-    with pytest.raises(ValueError, match="gateway-managed"):
-        manager._command(spec, spec.model_path, 30000)
-    with pytest.raises(ValueError, match="gateway-managed"):
-        ModelManager(catalog, vllm_args=(argument,))
-
-
 async def test_startup_diagnostic_drains_exit_tail_and_reuses_cooldown_id(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -516,7 +327,7 @@ async def test_startup_diagnostic_drains_exit_tail_and_reuses_cooldown_id(
     diagnostic = first.value.diagnostic
     assert diagnostic.code == "kv_cache_memory_insufficient"
     with pytest.raises(BackendStartupError) as cooldown:
-        await manager.acquire("a")
+        await manager.acquire("model-a")
     assert cooldown.value.diagnostic is diagnostic
     status = await manager.backend_status("model-a")
     assert status["diagnostic"] == diagnostic.as_dict()
@@ -526,7 +337,7 @@ async def test_startup_diagnostic_drains_exit_tail_and_reuses_cooldown_id(
 
     manager.failure_cooldown = 0
     with pytest.raises(BackendStartupError) as restart:
-        await manager.acquire("a")
+        await manager.acquire("model-a")
     assert restart.value.diagnostic.code == "backend_startup_failed"
     assert restart.value.diagnostic.diagnostic_id != diagnostic.diagnostic_id
     await manager.shutdown()
@@ -542,9 +353,9 @@ async def test_timeout_and_parallel_backend_diagnostics_are_isolated(monkeypatch
         raise TimeoutError("secret URL")
 
     monkeypatch.setattr(manager, "_start_backend", fake_start)
-    results = await asyncio.gather(manager.acquire("a"), manager.acquire("b"), return_exceptions=True)
+    results = await asyncio.gather(manager.acquire("model-a"), manager.acquire("model-b"), return_exceptions=True)
     assert all(isinstance(result, BackendStartupError) for result in results)
-    statuses = [await manager.backend_status(name) for name in ("a", "b")]
+    statuses = [await manager.backend_status(name) for name in ("model-a", "model-b")]
     assert statuses[0]["diagnostic"]["code"] == "cuda_out_of_memory"
     assert statuses[1]["diagnostic"]["code"] == "backend_startup_timeout"
     assert statuses[0]["diagnostic"]["diagnostic_id"] != statuses[1]["diagnostic"]["diagnostic_id"]
@@ -553,7 +364,7 @@ async def test_timeout_and_parallel_backend_diagnostics_are_isolated(monkeypatch
 
 async def test_non_eof_output_cleanup_is_bounded_and_cancellation_keeps_no_diagnostic() -> None:
     manager = ModelManager(make_catalog())
-    backend = Backend(manager.catalog.get("a"), 30999)
+    backend = Backend(manager.catalog.get("model-a"), 30999)
     reader = asyncio.StreamReader()
     task = asyncio.create_task(manager._read_output(reader, backend.output, "model-a", 1))
     backend.output_task = task
@@ -594,7 +405,7 @@ async def test_successful_backend_continues_draining_large_stdout_and_stderr(
         await backend_output_feed(reader, output, name, generation)
 
     monkeypatch.setattr(manager, "_read_output", observe)
-    lease = await manager.acquire("a")
+    lease = await manager.acquire("model-a")
     try:
         await asyncio.wait_for(seen.wait(), timeout=5)
         assert lease.backend.state is BackendState.READY
@@ -628,9 +439,9 @@ async def test_cancelled_startup_finishes_reader_without_recording_failure(monke
     monkeypatch.setattr(asyncio, "create_subprocess_exec", spawn)
     monkeypatch.setattr(manager._client, "get", blocked_health)
     monkeypatch.setattr("vllm_gateway.manager.os.killpg", terminate)
-    acquiring = asyncio.create_task(manager.acquire("a"))
+    acquiring = asyncio.create_task(manager.acquire("model-a"))
     await entered.wait()
-    assert await manager.unload("a")
+    assert await manager.unload("model-a")
     with pytest.raises(RuntimeError, match="was cancelled"):
         await acquiring
     backend = manager._backends["model-a"]
@@ -653,7 +464,7 @@ async def test_crash_with_inherited_pipe_does_not_block_watcher() -> None:
     reader = asyncio.StreamReader()
     process.stdout = reader  # type: ignore[attr-defined]
     reader.feed_data(b"torch.OutOfMemoryError: private path\n")
-    backend = Backend(manager.catalog.get("a"), 30999, state=BackendState.READY, process=process)
+    backend = Backend(manager.catalog.get("model-a"), 30999, state=BackendState.READY, process=process)
     manager._backends["model-a"] = backend
     backend.output_task = asyncio.create_task(manager._read_output(reader, backend.output, "model-a", 0))
     await asyncio.wait_for(manager._watch_process(backend, 0, process), timeout=2)
@@ -661,4 +472,93 @@ async def test_crash_with_inherited_pipe_does_not_block_watcher() -> None:
     assert backend.diagnostic is not None
     assert backend.diagnostic.code == "cuda_out_of_memory"
     assert backend.output_task is None
+    await manager.shutdown()
+
+
+def flag_value(command: list[str], flag: str) -> str:
+    return command[command.index(flag) + 1]
+
+
+def test_command_uses_fixed_profile_and_alias_settings() -> None:
+    spec = ModelSpec(
+        name="my-alias",
+        model_path="/snap/qwen",
+        repo_id="org/qwen",
+        context_length=32768,
+        reasoning_parser="qwen3",
+        tool_call_parser="qwen3_coder",
+        mtp=True,
+    )
+    command = ModelManager(ModelCatalog([spec]))._command(spec, 30123)
+
+    assert command[1:3] == ["-m", "vllm.entrypoints.openai.api_server"]
+    assert flag_value(command, "--model") == "/snap/qwen"
+    assert flag_value(command, "--served-model-name") == "my-alias"
+    assert flag_value(command, "--host") == "127.0.0.1"
+    assert flag_value(command, "--port") == "30123"
+    assert flag_value(command, "--max-model-len") == "32768"
+    assert flag_value(command, "--kv-cache-dtype") == "fp8_e4m3"
+    assert flag_value(command, "--attention-backend") == "flashinfer"
+    assert flag_value(command, "--max-num-seqs") == "16"
+    assert flag_value(command, "--max-num-batched-tokens") == "2048"
+    assert flag_value(command, "--reasoning-parser") == "qwen3"
+    assert flag_value(command, "--tool-call-parser") == "qwen3_coder"
+    assert "--enable-auto-tool-choice" in command
+    assert json.loads(flag_value(command, "--speculative-config")) == {
+        "method": "mtp",
+        "num_speculative_tokens": 2,
+    }
+    for flag in ("--async-scheduling", "--enable-flashinfer-autotune", "--enable-prefix-caching"):
+        assert flag in command
+    assert "--device-ids" not in command
+
+
+def test_command_omits_family_flags_for_unknown_family() -> None:
+    spec = ModelSpec(name="plain", model_path="/snap/plain", context_length=4096)
+    command = ModelManager(ModelCatalog([spec]))._command(spec, 30000)
+
+    for flag in ("--reasoning-parser", "--tool-call-parser", "--enable-auto-tool-choice", "--speculative-config"):
+        assert flag not in command
+
+
+async def test_lease_works_as_async_context_manager() -> None:
+    manager = ModelManager(make_catalog())
+    backend = Backend(manager.catalog.get("model-a"), 30000, active_requests=1)
+
+    async with BackendLease(manager, backend) as lease:
+        assert lease.backend.active_requests == 1
+
+    assert backend.active_requests == 0
+    await manager.shutdown()
+
+
+async def test_capacity_rejects_second_active_model_then_evicts_idle_one(monkeypatch: pytest.MonkeyPatch) -> None:
+    manager = ModelManager(make_catalog(), max_loaded_models=1, shutdown_timeout=0.1)
+    install_fake_processes(monkeypatch, manager)
+
+    first = await manager.acquire("model-a")
+    with pytest.raises(CapacityError, match="active or loading"):
+        await manager.acquire("model-b")
+
+    await first.release()
+    second = await manager.acquire("model-b")
+    assert second.backend.spec.name == "model-b"
+    assert manager._backends["model-a"].state is BackendState.STOPPED
+    await second.release()
+    await manager.shutdown()
+
+
+async def test_restart_uses_the_current_spec_of_a_recreated_alias(monkeypatch: pytest.MonkeyPatch) -> None:
+    manager = ModelManager(make_catalog(), shutdown_timeout=0.1)
+    install_fake_processes(monkeypatch, manager)
+
+    lease = await manager.acquire("model-a")
+    await lease.release()
+    assert await manager.unload("model-a")
+
+    manager.catalog = ModelCatalog([ModelSpec(name="model-a", model_path=MODEL_DIR, context_length=16384)])
+    lease = await manager.acquire("model-a")
+
+    assert lease.backend.spec.context_length == 16384
+    await lease.release()
     await manager.shutdown()
