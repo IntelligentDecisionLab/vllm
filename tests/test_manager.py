@@ -632,7 +632,8 @@ async def test_model_that_fits_loads_without_evicting(monkeypatch: pytest.Monkey
 
 
 async def test_least_recently_used_idle_backend_is_evicted_for_room(monkeypatch: pytest.MonkeyPatch) -> None:
-    gpu = FakeGpu(total_gib=96, foreign_gib=52)
+    # Each model needs 10 GiB + overhead and keeps a safety margin free, so a third one only fits after an eviction.
+    gpu = FakeGpu(total_gib=96, foreign_gib=54)
     a, b, c = gpu_spec("a", 10), gpu_spec("b", 10), gpu_spec("c", 10)
     manager = gpu_manager(gpu, a, b, c)
     starts = install_gpu_processes(monkeypatch, manager, gpu)
@@ -670,15 +671,15 @@ async def test_backend_with_active_lease_is_never_evicted(monkeypatch: pytest.Mo
 
 
 async def test_insufficient_memory_reports_needed_and_free_gib(monkeypatch: pytest.MonkeyPatch) -> None:
-    gpu = FakeGpu(total_gib=96, foreign_gib=80)
+    gpu = FakeGpu(total_gib=96, foreign_gib=82)
     manager = gpu_manager(gpu, gpu_spec("a", 10))
     install_gpu_processes(monkeypatch, manager, gpu)
 
     with pytest.raises(CapacityError) as error:
         await manager.acquire("a")
 
-    assert error.value.free_bytes == 16 * GIB
-    assert error.value.needed_bytes > 16 * GIB
+    assert error.value.free_bytes == 14 * GIB
+    assert error.value.needed_bytes > error.value.free_bytes
     assert "GiB needed" in str(error.value) and "GiB free" in str(error.value)
     assert diagnose_backend_error(error.value).code == "insufficient_gpu_memory"
     # The failed admission must not leave the startup gate held.

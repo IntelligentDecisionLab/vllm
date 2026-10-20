@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import math
+
 import pytest
 
 from vllm_gateway.catalog import ModelSpec
@@ -44,7 +46,10 @@ def test_kv_pool_scales_with_context_only_by_the_per_token_size() -> None:
 
 def test_utilization_is_rounded_up_to_two_decimals_and_capped() -> None:
     plan = plan_memory(spec(10, 0, 4096), 100 * GIB)
-    assert plan.gpu_memory_utilization == pytest.approx(0.16)
+    assert plan.gpu_memory_utilization == pytest.approx(math.ceil((10 * GIB + OVERHEAD_BYTES) / GIB) / 100)
+    assert plan_memory(spec(10.5, 0, 4096), 100 * GIB).gpu_memory_utilization == pytest.approx(
+        math.ceil((10.5 * GIB + OVERHEAD_BYTES) / GIB) / 100
+    )
 
     assert plan_memory(spec(200, 0, 4096), 100 * GIB).gpu_memory_utilization == 1.0
 

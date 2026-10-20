@@ -11,7 +11,8 @@ GIB = 1 << 30
 # Calibrate these on the target GPU with a real model; every estimate derives from them.
 KV_FULL_SEQS = 2  # sequences of full context length the KV cache must hold
 KV_MARGIN = 1.2  # hybrid linear-attention state and block rounding
-OVERHEAD_BYTES = 6 * GIB  # activations, CUDA graphs, CUDA context
+# CUDA context, CUDA graphs and activations. Measured about 2 GiB on top of weights + KV for Qwen3.5-9B.
+OVERHEAD_BYTES = 4 * GIB
 SAFETY_BYTES = 2 * GIB  # headroom that must stay free on top of the estimate
 
 
@@ -36,7 +37,7 @@ def plan_memory(spec: ModelSpec, gpu_total_bytes: int) -> MemoryPlan:
         spec.kv_bytes_per_token * (spec.context_length or 0) * KV_FULL_SEQS * KV_MARGIN,
     )
     total = spec.weights_bytes + kv_cache_bytes + OVERHEAD_BYTES
-    utilization = min(1.0, math.ceil(total / gpu_total_bytes * 100) / 100)
+    utilization = min(1.0, math.ceil(total * 100 / gpu_total_bytes) / 100)
     return MemoryPlan(spec.weights_bytes, kv_cache_bytes, OVERHEAD_BYTES, utilization)
 
 
