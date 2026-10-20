@@ -1,0 +1,24 @@
+services:
+  gateway:
+    build: .
+    image: vllm-gateway:local
+    # Run as the user that owns the shared Hugging Face cache, with the hfusers group.
+    user: "${GATEWAY_UID:?set GATEWAY_UID in .env}:${GATEWAY_GID:-1012}"
+    ports:
+      - "${GATEWAY_PORT:-11432}:11432"
+    environment:
+      NVIDIA_VISIBLE_DEVICES: "${GATEWAY_GPU:?set GATEWAY_GPU in .env to the GPU UUID}"
+      NVIDIA_DRIVER_CAPABILITIES: compute,utility
+      HF_TOKEN: "${HF_TOKEN:-}"
+    runtime: nvidia
+    volumes:
+      - "${HF_CACHE_DIR:-/data/huggingface}:/data/huggingface"
+      - gateway-state:/state
+    init: true
+    ipc: host
+    # Uvicorn graceful shutdown plus draining every backend must fit in this window.
+    stop_grace_period: 120s
+    restart: unless-stopped
+
+volumes:
+  gateway-state:

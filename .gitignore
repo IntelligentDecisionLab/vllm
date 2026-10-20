@@ -12,3 +12,4 @@ wheels/
 # Teamwork agent artifacts
 .agents/
 .pi/
+.env
