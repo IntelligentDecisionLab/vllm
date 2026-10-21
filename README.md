@@ -37,22 +37,22 @@ The GPU may be shared with other people's processes. The gateway reads the free 
 
 ## API
 
-A guide for people who only send requests is in [docs/usage.md](docs/usage.md). Examples assume `http://idlab:11432`.
+A guide for people who only send requests is in [docs/usage.md](docs/usage.md). Examples assume `http://140.109.21.51:11432`.
 
 ```bash
 # Models available in the cache, with size, maximum context and the aliases that use them
-curl http://idlab:11432/models/local
+curl http://140.109.21.51:11432/models/local
 
 # Download a model in the background, then poll the job
-curl -X POST http://idlab:11432/models/download -H 'content-type: application/json' \
+curl -X POST http://140.109.21.51:11432/models/download -H 'content-type: application/json' \
   -d '{"repo_id": "Qwen/Qwen3.5-9B"}'
-curl http://idlab:11432/models/downloads/<job id>
+curl http://140.109.21.51:11432/models/downloads/<job id>
 
 # Create an alias, optionally load it, and use it
-curl -X POST http://idlab:11432/aliases -H 'content-type: application/json' \
+curl -X POST http://140.109.21.51:11432/aliases -H 'content-type: application/json' \
   -d '{"alias": "alice-9b-64k", "model": "Qwen/Qwen3.5-9B", "context_length": 65536}'
-curl -X POST http://idlab:11432/aliases/alice-9b-64k/load
-curl http://idlab:11432/v1/chat/completions -H 'content-type: application/json' \
+curl -X POST http://140.109.21.51:11432/aliases/alice-9b-64k/load
+curl http://140.109.21.51:11432/v1/chat/completions -H 'content-type: application/json' \
   -d '{"model": "alice-9b-64k", "messages": [{"role": "user", "content": "Hello"}]}'
 ```
 

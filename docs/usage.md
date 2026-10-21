@@ -2,7 +2,7 @@
 
 This guide is for people who send requests to the gateway. Running and deploying it is covered in the [README](../README.md).
 
-The gateway serves an OpenAI-compatible API at `http://idlab:11432`. It has no authentication and is reachable only from the internal network. It shares one GPU with everyone who uses it, and with other processes on that GPU.
+The gateway runs on idlab and serves an OpenAI-compatible API at `http://140.109.21.51:11432`. Use the IP address: the host name `idlab` does not resolve on the other lab machines. The gateway has no authentication and is reachable only from the internal network. It shares one GPU with everyone who uses it, and with other processes on that GPU.
 
 ## Concepts
 
@@ -16,18 +16,18 @@ Only the model and the context length are yours to pick. Everything else, such a
 
 ```bash
 # 1. See which models are available and their maximum context
-curl http://idlab:11432/models/local
+curl http://140.109.21.51:11432/models/local
 
 # 2. Create your alias
-curl -X POST http://idlab:11432/aliases -H 'content-type: application/json' \
+curl -X POST http://140.109.21.51:11432/aliases -H 'content-type: application/json' \
   -d '{"alias": "alice-9b-64k", "model": "Qwen/Qwen3.5-9B", "context_length": 65536}'
 
 # 3. Chat. The first request loads the backend, so it can take a few minutes
-curl http://idlab:11432/v1/chat/completions -H 'content-type: application/json' \
+curl http://140.109.21.51:11432/v1/chat/completions -H 'content-type: application/json' \
   -d '{"model": "alice-9b-64k", "messages": [{"role": "user", "content": "Hello"}]}'
 
 # 4. Unload when you are done, so others can use the memory
-curl -X POST http://idlab:11432/aliases/alice-9b-64k/unload
+curl -X POST http://140.109.21.51:11432/aliases/alice-9b-64k/unload
 ```
 
 With the OpenAI Python SDK, point `base_url` at `/v1` and pass any API key:
@@ -35,7 +35,7 @@ With the OpenAI Python SDK, point `base_url` at `/v1` and pass any API key:
 ```python
 from openai import OpenAI
 
-client = OpenAI(base_url="http://idlab:11432/v1", api_key="unused", timeout=900)
+client = OpenAI(base_url="http://140.109.21.51:11432/v1", api_key="unused", timeout=900)
 reply = client.chat.completions.create(
     model="alice-9b-64k",
     messages=[{"role": "user", "content": "Hello"}],
@@ -122,9 +122,9 @@ Tool calling is enabled with automatic tool choice when the model has a tool-cal
 If the model you need is not in `/models/local`, download it:
 
 ```bash
-curl -X POST http://idlab:11432/models/download -H 'content-type: application/json' \
+curl -X POST http://140.109.21.51:11432/models/download -H 'content-type: application/json' \
   -d '{"repo_id": "Qwen/Qwen3-0.6B"}'
-curl http://idlab:11432/models/downloads/<job id>
+curl http://140.109.21.51:11432/models/downloads/<job id>
 ```
 
 The job state goes `queued`, `running`, then `succeeded` or `failed`. Downloads run one at a time. Only safetensors, JSON, tokenizer and template files are fetched. The request is rejected with 507 when less than 20 GiB of disk would remain. Downloaded models are in the shared cache and visible to everyone.
