@@ -22,7 +22,7 @@ The `vllm-service` and `vllm-gateway` scripts in `pyproject.toml` call the same 
 - `tests/test_memory.py`: the memory estimate and the `nvidia-smi` fallback parser.
 - `tests/test_downloads.py`: download jobs, deduplication, disk check and pruning, with fake Hub functions.
 - `tests/test_app.py`: HTTP routing, model/alias/download endpoints, stream lease cleanup, diagnostics. Uses `FakeManager`.
-- `tests/test_manager.py`: asynchronous lifecycle, startup serialization, memory admission and eviction with a fake GPU, draining, crashes, ports.
+- `tests/test_manager.py`: asynchronous lifecycle, startup serialization, memory admission and idle unload with a fake GPU, draining, crashes, ports.
 - `tests/test_diagnostics.py`: failure classification.
 
 Narrow the loop according to the change:
@@ -68,7 +68,7 @@ docker compose logs gateway | grep -F '<diagnostic_id>'
 
 | `error.code` | Meaning |
 | --- | --- |
-| `insufficient_gpu_memory` | Not enough free GPU memory even after evicting idle backends. The message gives GiB needed and free |
+| `insufficient_gpu_memory` | Not enough free GPU memory. Loaded backends are not stopped to make room. The message gives GiB needed and free |
 | `kv_cache_memory_insufficient` | vLLM could not allocate KV cache blocks |
 | `cuda_out_of_memory` | Explicit CUDA/PyTorch OOM |
 | `backend_startup_timeout` | Readiness was not reached before the startup deadline |
@@ -96,6 +96,6 @@ Changes to command generation, memory estimation or the image need this smoke te
 2. `GET /health` returns 200 and shows the GPU's free and total memory.
 3. Download a small dense model and a hybrid one (for example `Qwen/Qwen3-0.6B` and `Qwen/Qwen3.5-9B`) and wait for the jobs to succeed. Confirm that the new files are writable by the cache's group.
 4. Create an alias for the hybrid model and load it. In the log, `reserved … GiB memory for KV Cache` should match the estimate and the measured GPU use should stay below it. Send one non-streaming and one streaming chat completion, and one long prompt with several concurrent requests.
-5. Create more aliases than fit. Loading the last one must evict the least recently used idle backend. An alias that cannot fit an empty GPU must be rejected with 400 at creation.
+5. Create more aliases than fit. Loading the last one must fail with 503 `insufficient_gpu_memory` and leave every loaded backend `ready`, and it must succeed after one of them is unloaded. An alias that cannot fit an empty GPU must be rejected with 400 at creation.
 6. `docker compose restart` keeps the aliases. `docker compose down` returns quickly, and the GPU memory returns to the baseline.
 7. Inside the image, `nvcc --version` must be CUDA 12.9 or newer for Blackwell (SM 12.x) FlashInfer JIT. To debug a backend by hand, set `CUDA_HOME=/usr/local/cuda` and put `/usr/local/cuda/bin` on `PATH`.

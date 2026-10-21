@@ -40,7 +40,7 @@ class BackendState(StrEnum):
 
 
 class CapacityError(RuntimeError):
-    """Not enough free GPU memory, even after evicting every idle backend."""
+    """Not enough free GPU memory. Other backends are never stopped to make room."""
 
     def __init__(self, needed_bytes: int, free_bytes: int):
         super().__init__(
@@ -183,13 +183,11 @@ class ModelManager:
         shutdown_timeout: float = 30.0,
         idle_seconds: float = IDLE_SECONDS,
         failure_cooldown: float = 2.0,
-        settle_seconds: float = 1.0,
     ):
         self.catalog = catalog
         self.backend_port = backend_port
         self.backend_port_count = backend_port_count
         self._gpu_memory = gpu_memory
-        self.settle_seconds = settle_seconds
         self.startup_timeout = startup_timeout
         self.shutdown_timeout = shutdown_timeout
         self.idle_seconds = idle_seconds
@@ -372,7 +370,7 @@ class ModelManager:
                 raise RuntimeError(f"loading model {spec.name!r} was cancelled") from None
 
     async def _admit_and_start(self, spec: ModelSpec) -> asyncio.Task[None] | None:
-        """Make room for `spec` and start it. Returns None when the state changed while queued."""
+        """Admit `spec` against free GPU memory and start it. Returns None when the state changed while queued."""
 
         await self._startup_gate.acquire()
         handed_off = False
@@ -388,7 +386,7 @@ class ModelManager:
                 if backend and backend.state in self._RESIDENT_STATES:
                     return None
 
-            memory = await self._make_room(spec) if self._gpu_memory is not None else None
+            memory = await self._check_capacity(spec) if self._gpu_memory is not None else None
 
             async with self._lock:
                 if self._stopping:
@@ -433,34 +431,17 @@ class ModelManager:
         assert self._gpu_memory is not None
         return await asyncio.to_thread(self._gpu_memory)
 
-    async def _make_room(self, spec: ModelSpec) -> MemoryPlan:
-        """Evict idle backends, least recently used first, until `spec` fits in free GPU memory."""
+    async def _check_capacity(self, spec: ModelSpec) -> MemoryPlan:
+        """Plan `spec` against the current free GPU memory, or raise CapacityError.
+
+        Loaded backends belong to other users, so they are never stopped to make room. Memory comes back
+        only through idle unload, an explicit unload or an alias delete.
+        """
 
         free, total = await self._measure_gpu()
         plan = plan_memory(spec, total)
-        while free < plan.required_free_bytes:
-            stop_task: asyncio.Task[None] | None = None
-            async with self._lock:
-                idle = [
-                    item
-                    for item in self._backends.values()
-                    if item.state is BackendState.READY and item.active_requests == 0
-                ]
-                if idle:
-                    victim = min(idle, key=lambda item: item.last_used)
-                    victim.state = BackendState.DRAINING
-                    if not victim.stop_task or victim.stop_task.done():
-                        victim.stop_task = asyncio.create_task(
-                            self._drain_and_stop(victim, victim.generation, self.shutdown_timeout),
-                            name=f"vllm-evict-{victim.spec.name}",
-                        )
-                    stop_task = victim.stop_task
-                    self._changed.notify_all()
-            if stop_task is None:
-                raise CapacityError(plan.required_free_bytes, free)
-            await asyncio.shield(stop_task)
-            await asyncio.sleep(self.settle_seconds)
-            free, total = await self._measure_gpu()
+        if free < plan.required_free_bytes:
+            raise CapacityError(plan.required_free_bytes, free)
         return plan
 
     async def validate_fits(self, spec: ModelSpec) -> None:

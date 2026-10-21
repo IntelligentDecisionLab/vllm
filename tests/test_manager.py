@@ -600,7 +600,7 @@ def install_gpu_processes(monkeypatch: pytest.MonkeyPatch, manager: ModelManager
 
 
 def gpu_manager(gpu: FakeGpu, *specs: ModelSpec) -> ModelManager:
-    return ModelManager(ModelCatalog(specs), gpu_memory=gpu.query, shutdown_timeout=0.1, settle_seconds=0)
+    return ModelManager(ModelCatalog(specs), gpu_memory=gpu.query, shutdown_timeout=0.1)
 
 
 def test_command_carries_the_memory_plan() -> None:
@@ -613,7 +613,7 @@ def test_command_carries_the_memory_plan() -> None:
     assert "--kv-cache-memory-bytes" not in ModelManager(ModelCatalog([spec]))._command(spec, 30000)
 
 
-async def test_model_that_fits_loads_without_evicting(monkeypatch: pytest.MonkeyPatch) -> None:
+async def test_model_that_fits_loads_alongside_others(monkeypatch: pytest.MonkeyPatch) -> None:
     gpu = FakeGpu(total_gib=96, foreign_gib=20)
     manager = gpu_manager(gpu, gpu_spec("a", 10), gpu_spec("b", 10))
     starts = install_gpu_processes(monkeypatch, manager, gpu)
@@ -631,42 +631,55 @@ async def test_model_that_fits_loads_without_evicting(monkeypatch: pytest.Monkey
     await manager.shutdown()
 
 
-async def test_least_recently_used_idle_backend_is_evicted_for_room(monkeypatch: pytest.MonkeyPatch) -> None:
-    # Each model needs 10 GiB + overhead and keeps a safety margin free, so a third one only fits after an eviction.
+async def test_loaded_backends_are_never_stopped_to_make_room(monkeypatch: pytest.MonkeyPatch) -> None:
+    # Each model needs 10 GiB + overhead and keeps a safety margin free, so only two fit next to the foreign use.
     gpu = FakeGpu(total_gib=96, foreign_gib=54)
-    a, b, c = gpu_spec("a", 10), gpu_spec("b", 10), gpu_spec("c", 10)
-    manager = gpu_manager(gpu, a, b, c)
+    manager = gpu_manager(gpu, gpu_spec("a", 10), gpu_spec("b", 10), gpu_spec("c", 10))
     starts = install_gpu_processes(monkeypatch, manager, gpu)
 
-    for name in ("a", "b"):
-        await (await manager.acquire(name)).release()
-    await (await manager.acquire("a")).release()  # "b" is now the least recently used
-    lease_c = await manager.acquire("c")
+    active = await manager.acquire("a")
+    await (await manager.acquire("b")).release()  # idle, but still owned by its user
+    with pytest.raises(CapacityError, match="insufficient GPU memory"):
+        await manager.acquire("c")
 
-    assert starts == ["a", "b", "c"]
-    assert manager._backends["b"].state is BackendState.STOPPED
+    assert starts == ["a", "b"]
     assert manager._backends["a"].state is BackendState.READY
+    assert manager._backends["a"].active_requests == 1
+    assert manager._backends["b"].state is BackendState.READY
+    assert set(gpu.running) == {"a", "b"}
+
+    # Memory comes back only when a user unloads (or the idle timeout does).
+    assert await manager.unload("b") is True
+    lease_c = await manager.acquire("c")
     assert set(gpu.running) == {"a", "c"}
     await lease_c.release()
+    await active.release()
     await manager.shutdown()
 
 
-async def test_backend_with_active_lease_is_never_evicted(monkeypatch: pytest.MonkeyPatch) -> None:
-    gpu = FakeGpu(total_gib=96, foreign_gib=40)
-    manager = gpu_manager(gpu, gpu_spec("a", 10), gpu_spec("b", 10), gpu_spec("c", 10))
+async def test_idle_timeout_frees_memory_for_the_next_model(monkeypatch: pytest.MonkeyPatch) -> None:
+    gpu = FakeGpu(total_gib=96, foreign_gib=70)
+    manager = ModelManager(
+        ModelCatalog([gpu_spec("a", 10), gpu_spec("b", 10)]),
+        gpu_memory=gpu.query,
+        shutdown_timeout=0.1,
+        idle_seconds=0.05,
+    )
     install_gpu_processes(monkeypatch, manager, gpu)
+    await manager.start()
 
-    active = await manager.acquire("a")
-    await (await manager.acquire("b")).release()
-    with pytest.raises(CapacityError, match="insufficient GPU memory"):
-        # a (active) and b together leave no room, so only b may be evicted; c still does not fit alongside a.
-        gpu.foreign = 70 * GIB
-        await manager.acquire("c")
+    await (await manager.acquire("a")).release()
+    with pytest.raises(CapacityError):
+        await manager.acquire("b")
 
-    assert manager._backends["a"].state is BackendState.READY
-    assert manager._backends["a"].active_requests == 1
-    assert "a" in gpu.running
-    await active.release()
+    for _ in range(50):
+        if manager._backends["a"].state is BackendState.STOPPED:
+            break
+        await asyncio.sleep(0.1)
+    assert manager._backends["a"].state is BackendState.STOPPED
+    lease_b = await manager.acquire("b")
+    assert set(gpu.running) == {"b"}
+    await lease_b.release()
     await manager.shutdown()
 
 
@@ -706,7 +719,6 @@ async def test_failed_startup_releases_the_gate_for_the_next_model(monkeypatch: 
         gpu_memory=gpu.query,
         failure_cooldown=0.0,
         shutdown_timeout=0.1,
-        settle_seconds=0,
     )
     install_gpu_processes(monkeypatch, manager, gpu)
     real_start = manager._start_backend

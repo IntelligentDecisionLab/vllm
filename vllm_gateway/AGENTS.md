@@ -7,7 +7,7 @@
 - `cli.py` 只負責解析設定、組裝 catalog/manager/downloads/app 與啟動 Uvicorn。
 - `catalog.py` 負責 HF cache 掃描、`config.json` 解析（family profile、KV 大小、MTP）、`ModelSpec` 與 alias 持久化；不要讓它管理 process 或讀 GPU。
 - `memory.py` 只做記憶體估算與 GPU 記憶體查詢；估算常數（`KV_FULL_SEQS`、`KV_MARGIN`、`OVERHEAD_BYTES`、`SAFETY_BYTES`）集中在此檔。
-- `manager.py` 是 backend process、port、admission、eviction、lease 與 lifecycle 的唯一 owner，也是所有寫死 vLLM 參數的位置。
+- `manager.py` 是 backend process、port、admission、lease、idle unload 與 lifecycle 的唯一 owner，也是所有寫死 vLLM 參數的位置。
 - `downloads.py` 只負責背景下載與磁碟檢查；不要讓它碰 backend。
 - `app.py` 負責 HTTP contract、alias routing 與 response streaming；不要在 route handler 自行啟停 process。
 - `__main__.py` 只保留 module entry point。
@@ -17,8 +17,8 @@
 - `ModelSpec` 維持 frozen/slots dataclass。新增欄位時同步 `ModelCatalog` 的解析與持久化、alias API、`_command()`（如影響 backend 參數）、`plan_memory()`（如影響記憶體）與 tests。
 - Alias 只接受精確比對；不要加入 repo id、正規化名稱或大小寫不分的 lookup。
 - `ModelManager._lock` 保護 backend map、state、active request count 與 port ownership。不要在持有 lock 時等待 subprocess、HTTP、NVML 或長時間工作；使用 task 和 condition 協調。
-- `_startup_gate` 序列化「量測 free memory → 驅逐 → 啟動」。它由 start task 的 done callback 釋放，不能依賴 task 內的 `finally`（task 可能在第一步前就被 cancel）。
-- 驅逐只能選 `READY` 且 `active_requests == 0` 的 backend。
+- `_startup_gate` 序列化「量測 free memory → 啟動」。它由 start task 的 done callback 釋放，不能依賴 task 內的 `finally`（task 可能在第一步前就被 cancel）。
+- Admission 不得為了騰出空間停掉其他 backend；記憶體不足就回 `CapacityError`。Backend 只由明確 unload/delete、idle timeout（限 `READY` 且 `active_requests == 0`）、crash 或 shutdown 停止。
 - 每個成功取得的 `BackendLease` 必須在普通 response、SSE、HTTP error、cancellation 與 exception 路徑釋放一次。
 - Readiness 必須驗證 backend `/health` 和 `/v1/models` 中的 alias，不能只檢查 port 是否開啟。
 - 停止程序時只操作 manager 建立的 process group。不要加入全機 process scan 或對 foreign process 發 signal。

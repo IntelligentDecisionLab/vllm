@@ -8,7 +8,7 @@ An OpenAI-compatible endpoint (default `:11432`) for a lab server. It serves the
 - An **alias** binds a model to a context length. Create one per use (`POST /aliases`) and call it through the OpenAI API by putting the alias in `model`.
 - Each alias gets its own vLLM process, started on its first request or by `POST /aliases/{alias}/load`.
 - Everything except the model and context length is fixed. Parsers and speculative decoding come from the model's `config.json`, and the GPU memory share is computed from the model size and context length.
-- A backend that sits idle for one hour is unloaded. When a new model does not fit in the free GPU memory, idle backends are evicted, least recently used first. A backend with active requests is never evicted.
+- A backend that sits idle for one hour is unloaded. Loaded backends are never stopped to make room for another model, so when a new model does not fit in the free GPU memory the load fails with `insufficient_gpu_memory` until a backend is unloaded or times out.
 - Only one backend loads at a time (about 5 minutes for a 9B model), so a request for a second unloaded model waits for the first load to finish.
 
 ## Deploy with Docker

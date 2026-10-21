@@ -11,7 +11,7 @@ The gateway runs in a Docker container that can see exactly one GPU. The gateway
 - `vllm_gateway/cli.py`: parses CLI arguments and environment variables, builds the catalog, manager and app, and starts Uvicorn.
 - `vllm_gateway/catalog.py`: scans the Hugging Face cache, reads `config.json` to derive the family profile, KV size and MTP support, and owns the persisted alias registry (`ModelSpec`, `ModelCatalog`).
 - `vllm_gateway/memory.py`: the memory estimate for one model and context length, and the GPU memory query.
-- `vllm_gateway/manager.py`: allocates private ports, creates vLLM subprocesses, runs readiness probes, and manages admission, leases, eviction, idle unload and shutdown.
+- `vllm_gateway/manager.py`: allocates private ports, creates vLLM subprocesses, runs readiness probes, and manages admission, leases, idle unload and shutdown.
 - `vllm_gateway/downloads.py`: background Hugging Face downloads with a disk-space check.
 - `vllm_gateway/diagnostics.py`: classification of backend failures into safe codes with a diagnostic ID.
 - `vllm_gateway/app.py`: HTTP routes for models, aliases, downloads and health, plus a catch-all proxy.
@@ -26,7 +26,7 @@ The gateway runs in a Docker container that can see exactly one GPU. The gateway
 4. `acquire()` returns a lease for a ready backend, shares the startup task of a loading one, or admits and starts a new one.
 5. The manager forwards the request to `127.0.0.1:<private-port>`. The app releases the lease after a normal response is fully read, an SSE stream closes, or the proxy raises an exception.
 
-Leases tell shutdown, unload, delete and eviction when it is safe to stop a backend. Every successful acquire must be released exactly once.
+Leases tell shutdown, unload, delete and idle unload when it is safe to stop a backend. Every successful acquire must be released exactly once.
 
 ## Backend lifecycle
 
@@ -38,7 +38,7 @@ STOPPED -> LOADING -> READY -> DRAINING -> STOPPED
 Invariants:
 
 - I1 Every successful acquire is released exactly once on every path (normal, SSE, HTTP error, cancellation, exception).
-- I2 Eviction only picks a backend that is `READY` with zero active leases.
+- I2 Admission never stops another backend. A backend is stopped only by an explicit unload or delete, the idle timeout (only when `READY` with zero active leases), a crash, or shutdown.
 - I3 Signals go only to the process group the manager created. Other processes on the GPU are never touched.
 - I4 Concurrent first requests for one alias share a single startup. Cancelling a waiter does not cancel it.
 - I5 `ModelManager._lock` is never held while waiting for a subprocess, HTTP, or an NVML call.
@@ -47,9 +47,9 @@ Invariants:
 - A backend becomes `READY` only when `/health` and `/v1/models` (which must list the alias) both succeed.
 - A `DRAINING` backend accepts no new leases. The manager waits for active leases, then stops the process group with SIGTERM and SIGKILL after the timeout.
 
-## Admission and eviction
+## Admission
 
-Before starting a model, `_make_room()` measures the free memory of the whole GPU, which includes other users, and compares it with the estimate plus a safety margin (see [configuration](configuration.md#memory-estimate)). While it does not fit, it drains the least recently used idle backend, waits for the memory to be released and measures again. When no idle backend is left it raises `CapacityError`, which the API reports as 503 `insufficient_gpu_memory`.
+Before starting a model, `_check_capacity()` measures the free memory of the whole GPU, which includes other users, and compares it with the estimate plus a safety margin (see [configuration](configuration.md#memory-estimate)). When it does not fit it raises `CapacityError`, which the API reports as 503 `insufficient_gpu_memory`. It never stops a loaded backend to make room: each one belongs to a user who may come back within the idle hour, and evicting it would let concurrent users unload each other's models in turn. Memory comes back through the idle timeout, an explicit unload, or an alias delete.
 
 `validate_fits()` rejects, at alias creation, a model that would not fit even on an empty GPU.
 
