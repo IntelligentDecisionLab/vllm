@@ -37,7 +37,7 @@ The GPU may be shared with other people's processes. The gateway reads the free 
 
 ## API
 
-Examples assume `http://idlab:11432`.
+A guide for people who only send requests is in [docs/usage.md](docs/usage.md). Examples assume `http://idlab:11432`.
 
 ```bash
 # Models available in the cache, with size, maximum context and the aliases that use them
