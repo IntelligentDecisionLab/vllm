@@ -1,6 +1,6 @@
 services:
   gateway:
-    image: ghcr.io/novis10813/vllm-gateway:latest
+    image: ghcr.io/intelligentdecisionlab/vllm-gateway:latest
     # Run as the user that owns the shared Hugging Face cache, with the hfusers group.
     user: "${GATEWAY_UID:?set GATEWAY_UID in .env}:${GATEWAY_GID:-1012}"
     ports:

@@ -85,7 +85,7 @@ docker compose logs gateway | grep -F '<diagnostic_id>'
 Docker is the only deployment path. On the server:
 
 ```bash
-git clone -b <branch> https://github.com/novis10813/vllm.git && cd vllm
+git clone -b <branch> https://github.com/IntelligentDecisionLab/vllm.git && cd vllm
 cp .env.example .env     # set GATEWAY_UID, GATEWAY_GID, GATEWAY_GPU
 docker compose up -d --build
 ```
